@@ -1,0 +1,25 @@
+appId: com.mignot.careerwatch
+productName: Career Watch
+directories:
+  output: release
+  buildResources: resources
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: resources/tray.png
+    to: tray.png
+  - from: resources/tray@2x.png
+    to: tray@2x.png
+win:
+  target: nsis
+  icon: resources/icon.png
+  # We do not code-sign. Leaving signing enabled makes electron-builder unpack
+  # its winCodeSign bundle, which contains macOS symlinks that Windows refuses
+  # to create without Developer Mode or admin rights - packaging then fails on
+  # an unrelated privilege error. Turning it off skips that download entirely.
+  signAndEditExecutable: false
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true

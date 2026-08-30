@@ -1,0 +1,168 @@
+@import 'tailwindcss';
+
+/*
+ * Material 3 Expressive tonal palette from a single violet seed.
+ * @theme maps the M3 role names onto Tailwind utilities (bg-surface,
+ * text-on-surface-variant, ...); the --md-* vars underneath are what actually
+ * swap between light and dark at runtime.
+ */
+@theme {
+  --color-primary: var(--md-primary);
+  --color-on-primary: var(--md-on-primary);
+  --color-primary-container: var(--md-primary-container);
+  --color-on-primary-container: var(--md-on-primary-container);
+
+  --color-secondary: var(--md-secondary);
+  --color-tertiary: var(--md-tertiary);
+
+  --color-surface: var(--md-surface);
+  --color-surface-container-low: var(--md-surface-container-low);
+  --color-surface-container: var(--md-surface-container);
+  --color-surface-container-high: var(--md-surface-container-high);
+  --color-on-surface: var(--md-on-surface);
+  --color-on-surface-variant: var(--md-on-surface-variant);
+
+  --color-outline: var(--md-outline);
+  --color-outline-variant: var(--md-outline-variant);
+
+  --color-positive: var(--md-positive);
+  --color-warning: var(--md-warning);
+  --color-danger: var(--md-error);
+
+  /* Expressive shape scale: large, confident corners. */
+  --radius-card: 28px;
+  --radius-panel: 20px;
+  --radius-pill: 999px;
+}
+
+:root {
+  --md-primary: oklch(0.5 0.22 295);
+  --md-on-primary: oklch(1 0 0);
+  --md-primary-container: oklch(0.9 0.07 295);
+  --md-on-primary-container: oklch(0.26 0.13 295);
+  --md-secondary: oklch(0.55 0.13 200);
+  --md-tertiary: oklch(0.62 0.18 20);
+
+  --md-surface: oklch(0.98 0.008 295);
+  --md-surface-container-low: oklch(0.96 0.012 295);
+  --md-surface-container: oklch(0.94 0.016 295);
+  --md-surface-container-high: oklch(0.92 0.02 295);
+  --md-on-surface: oklch(0.22 0.02 295);
+  --md-on-surface-variant: oklch(0.45 0.03 295);
+
+  --md-outline: oklch(0.6 0.03 295);
+  --md-outline-variant: oklch(0.85 0.02 295);
+
+  --md-positive: oklch(0.62 0.16 150);
+  --md-warning: oklch(0.72 0.16 75);
+  --md-error: oklch(0.55 0.21 25);
+
+  --mesh-a: oklch(0.75 0.18 295 / 0.55);
+  --mesh-b: oklch(0.78 0.15 200 / 0.45);
+  --mesh-c: oklch(0.8 0.16 20 / 0.4);
+  --glass-tint: 62%;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --md-primary: oklch(0.78 0.16 295);
+    --md-on-primary: oklch(0.24 0.14 295);
+    --md-primary-container: oklch(0.38 0.16 295);
+    --md-on-primary-container: oklch(0.9 0.07 295);
+    --md-secondary: oklch(0.75 0.11 200);
+    --md-tertiary: oklch(0.78 0.14 20);
+
+    --md-surface: oklch(0.18 0.02 295);
+    --md-surface-container-low: oklch(0.21 0.022 295);
+    --md-surface-container: oklch(0.24 0.025 295);
+    --md-surface-container-high: oklch(0.28 0.028 295);
+    --md-on-surface: oklch(0.94 0.01 295);
+    --md-on-surface-variant: oklch(0.76 0.02 295);
+
+    --md-outline: oklch(0.55 0.03 295);
+    --md-outline-variant: oklch(0.33 0.025 295);
+
+    --md-positive: oklch(0.75 0.16 150);
+    --md-warning: oklch(0.8 0.15 75);
+    --md-error: oklch(0.7 0.17 25);
+
+    --mesh-a: oklch(0.55 0.2 295 / 0.5);
+    --mesh-b: oklch(0.5 0.16 200 / 0.42);
+    --mesh-c: oklch(0.55 0.18 20 / 0.32);
+    --glass-tint: 48%;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--md-surface);
+  color: var(--md-on-surface);
+  font-family: 'Segoe UI Variable Display', 'Segoe UI', system-ui, sans-serif;
+  overflow: hidden;
+}
+
+/* Slow-drifting color mesh sitting behind every translucent surface. */
+.mesh-bg::before {
+  content: '';
+  position: fixed;
+  inset: -25%;
+  z-index: -1;
+  background:
+    radial-gradient(38rem 38rem at 18% 22%, var(--mesh-a), transparent 60%),
+    radial-gradient(34rem 34rem at 82% 28%, var(--mesh-b), transparent 62%),
+    radial-gradient(40rem 40rem at 50% 88%, var(--mesh-c), transparent 60%);
+  filter: blur(18px);
+  animation: mesh-drift 34s ease-in-out infinite alternate;
+}
+
+@keyframes mesh-drift {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(2.5%, -2%, 0) scale(1.06);
+  }
+  100% {
+    transform: translate3d(-2%, 2.5%, 0) scale(1.02);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mesh-bg::before {
+    animation: none;
+  }
+}
+
+/*
+ * The animated mesh plus backdrop-filter on every glass surface measured at
+ * ~35% of a CPU core even while sitting idle on the Dashboard - continuous
+ * repaint the user never sees, since the window isn't focused. Pausing both
+ * when the OS says the window lost focus removes that cost for a background
+ * tray app with no visible cost when it's actually in front.
+ */
+body.window-blurred .mesh-bg::before {
+  animation-play-state: paused;
+}
+
+body.window-blurred .glass {
+  backdrop-filter: none;
+  background-color: color-mix(in oklab, var(--md-surface-container) 92%, transparent);
+}
+
+/* The glass surface used by cards, the tab rail, and detail panes. */
+@utility glass {
+  background-color: color-mix(
+    in oklab,
+    var(--md-surface-container) var(--glass-tint),
+    transparent
+  );
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid
+    color-mix(in oklab, var(--md-outline-variant) 60%, transparent);
+}

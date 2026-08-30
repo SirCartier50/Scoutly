@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": [
+      "ES2023"
+    ],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "types": [
+      "@cloudflare/workers-types"
+    ],
+    "baseUrl": "..",
+    "paths": {
+      "@shared/*": [
+        "src/shared/*"
+      ],
+      "@core/*": [
+        "src/core/*"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "../src/core/**/*",
+    "../src/shared/**/*"
+  ]
+}

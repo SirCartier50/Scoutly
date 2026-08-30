@@ -1,0 +1,59 @@
+{
+  "name": "career-watch",
+  "version": "0.1.0",
+  "description": "Watches company career pages for internships, new-grad roles, and fellowship programs",
+  "main": "./out/main/index.js",
+  "author": "Mignot",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json && electron-vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p server/tsconfig.json",
+    "start": "electron-vite preview",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --win",
+    "fix:electron": "node scripts/fix-electron.mjs",
+    "postinstall": "node scripts/fix-electron.mjs",
+    "check:db": "node scripts/run-check.mjs scripts/db-check.ts",
+    "check:connectors": "node scripts/run-check.mjs scripts/connector-check.ts",
+    "check": "npm run check:db && npm run check:connectors && npm run check:e2e",
+    "check:e2e": "node scripts/run-check.mjs scripts/e2e-check.ts",
+    "make:shortcut": "powershell -ExecutionPolicy Bypass -File scripts/make-shortcut.ps1",
+    "server:dev": "wrangler dev --config server/wrangler.toml",
+    "server:deploy": "wrangler deploy --config server/wrangler.toml",
+    "server:migrate": "wrangler d1 migrations apply career-watch --config server/wrangler.toml --remote",
+    "server:migrate:local": "wrangler d1 migrations apply career-watch --config server/wrangler.toml --local",
+    "check:scout": "node scripts/run-check.mjs scripts/scout-check.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
+    "@cloudflare/workers-types": "^5.20260827.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^5.0.4",
+    "electron": "39.8.10",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^4.0.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12",
+    "wrangler": "^4.126.0"
+  },
+  "allowScripts": {
+    "electron@39.8.10": true,
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.2": true,
+    "workerd@1.20260825.1": true,
+    "esbuild@0.28.1": true
+  }
+}
