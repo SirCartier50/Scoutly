@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import { redirect } from 'next/navigation'
 import { auth, signOut } from '@/auth'
 import Dashboard from './Dashboard'
@@ -11,6 +12,9 @@ export default async function DashboardPage() {
       <header className="flex items-center justify-between border-b border-neutral-800 px-6 py-4">
         <h1 className="text-lg font-semibold tracking-tight">Career Watch</h1>
         <div className="flex items-center gap-3 text-sm text-neutral-400">
+          <Link href="/download" className="rounded-md border border-neutral-700 px-3 py-1 hover:bg-neutral-900">
+            Desktop app
+          </Link>
           <span>{session.user.email}</span>
           <form
             action={async () => {

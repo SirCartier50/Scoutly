@@ -1,5 +1,9 @@
 appId: com.mignot.careerwatch
 productName: Career Watch
+# Fixed name (no version number) so the web app's download link
+# (github.com/.../releases/latest/download/Career-Watch-Setup.exe) keeps
+# working across releases without editing the link every version bump.
+artifactName: "Career-Watch-Setup.${ext}"
 directories:
   output: release
   buildResources: resources

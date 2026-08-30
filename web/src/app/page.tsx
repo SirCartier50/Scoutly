@@ -1,3 +1,4 @@
+import Link from 'next/link'
 import { redirect } from 'next/navigation'
 import { auth, signIn } from '@/auth'
 
@@ -27,6 +28,9 @@ export default async function Home() {
           Continue with Google
         </button>
       </form>
+      <Link href="/download" className="text-sm text-neutral-400 underline hover:text-neutral-200">
+        Prefer the desktop app? Download for Windows
+      </Link>
     </main>
   )
 }
