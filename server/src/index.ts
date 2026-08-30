@@ -1,11 +1,13 @@
 import { registerWorkerHtmlParser } from './htmlParser'
-import { runCheck, DEFAULT_SETTINGS } from './check'
+import { runCheck, DEFAULT_USER_SETTINGS } from './check'
 import { probe } from '../../src/core/probe'
 import { runScout } from '../../src/core/agents/scout'
 import { captureNetworkCalls } from './render'
+import { verifyGoogleIdToken } from './auth'
 import {
-  deleteCompany, getSettings, listCompanies, recordAgentRun, setSettings, setWatched,
-  slugify, upsertCompany, type Env
+  addUserCompany, authenticateToken, getUserSettings, issueToken, listCompaniesForUser,
+  recordAgentRun, removeUserCompany, setUserPostingStatus, setUserSettings, slugify,
+  upsertCompany, upsertUser, type Env, type UserRow
 } from './d1'
 
 registerWorkerHtmlParser()
@@ -13,19 +15,17 @@ registerWorkerHtmlParser()
 /* --------------------------------------------------------------------- auth */
 
 /**
- * A single bearer token shared with the desktop client. This is a personal
- * single-user service; the token exists so a stray request cannot read the
- * user's watch list or trigger checks, not to support multi-tenancy.
+ * Resolves a request's bearer token to the user it belongs to. Replaces the
+ * old single shared CLIENT_TOKEN: every user (desktop or web) now presents
+ * their own per-user token, obtained once via /api/auth/google and stored
+ * client-side exactly the way the shared token used to be - the desktop
+ * app's serverClient needed zero code changes for this.
  */
-function authorized(req: Request, env: Env): boolean {
-  if (!env.CLIENT_TOKEN) return false
+async function authenticate(req: Request, env: Env): Promise<UserRow | null> {
   const header = req.headers.get('authorization') ?? ''
   const token = header.startsWith('Bearer ') ? header.slice(7) : ''
-  if (token.length !== env.CLIENT_TOKEN.length) return false
-  // Constant-time-ish compare so the token can't be guessed byte by byte.
-  let diff = 0
-  for (let i = 0; i < token.length; i++) diff |= token.charCodeAt(i) ^ env.CLIENT_TOKEN.charCodeAt(i)
-  return diff === 0
+  if (!token) return null
+  return await authenticateToken(env.DB, token)
 }
 
 const json = (body: unknown, status = 200): Response =>
@@ -36,26 +36,62 @@ const json = (body: unknown, status = 200): Response =>
 
 /* --------------------------------------------------------------------- api */
 
-async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
+/** The one public, unauthenticated endpoint: trading a Google ID token for a Career Watch bearer token. */
+async function handleGoogleAuth(req: Request, env: Env): Promise<Response> {
+  if (!env.GOOGLE_CLIENT_ID) return json({ error: 'server not configured for Google sign-in' }, 500)
+  const body = (await req.json().catch(() => null)) as { idToken?: string } | null
+  if (!body?.idToken) return json({ error: 'idToken required' }, 400)
+
+  let identity
+  try {
+    identity = await verifyGoogleIdToken(body.idToken, env.GOOGLE_CLIENT_ID)
+  } catch (err) {
+    return json({ error: `invalid Google token: ${err instanceof Error ? err.message : String(err)}` }, 401)
+  }
+
+  const user = await upsertUser(env.DB, {
+    googleSub: identity.sub, email: identity.email, name: identity.name, pictureUrl: identity.picture
+  })
+  const token = await issueToken(env.DB, user.id)
+
+  return json({
+    token,
+    user: { id: user.id, email: user.email, name: user.name, pictureUrl: user.picture_url }
+  })
+}
+
+async function handleApi(req: Request, env: Env, url: URL, user: UserRow): Promise<Response> {
   const db = env.DB
+  const userId = user.id
   const path = url.pathname.replace(/^\/api/, '')
 
   if (req.method === 'GET' && path === '/status') {
-    const companies = await listCompanies(db, true)
+    const companies = await listCompaniesForUser(db, userId)
     const open = await db
       .prepare(
-        `SELECT COUNT(*) AS n FROM postings p JOIN companies c ON c.id = p.company_id
-         WHERE p.closed_at IS NULL AND c.watched = 1 AND p.needs_triage = 0`
+        `SELECT COUNT(*) AS n FROM postings p
+         JOIN user_companies uc ON uc.company_id = p.company_id AND uc.user_id = ?
+         WHERE p.closed_at IS NULL AND p.needs_triage = 0`
       )
+      .bind(userId)
       .first<{ n: number }>()
     const applied = await db
-      .prepare("SELECT COUNT(*) AS n FROM postings WHERE app_status IN ('applied','interviewing','rejected','offer')")
+      .prepare(
+        `SELECT COUNT(*) AS n FROM user_posting_status
+         WHERE user_id = ? AND app_status IN ('applied','interviewing','rejected','offer')`
+      )
+      .bind(userId)
       .first<{ n: number }>()
     const run = await db
       .prepare('SELECT * FROM run_log ORDER BY started_at DESC LIMIT 1')
       .first<Record<string, unknown>>()
     const health = await db
-      .prepare('SELECT health, COUNT(*) AS n FROM companies WHERE watched = 1 GROUP BY health')
+      .prepare(
+        `SELECT c.health, COUNT(*) AS n FROM companies c
+         JOIN user_companies uc ON uc.company_id = c.id AND uc.user_id = ?
+         GROUP BY c.health`
+      )
+      .bind(userId)
       .all<{ health: string; n: number }>()
 
     const counts = { ok: 0, stale: 0, broken: 0 }
@@ -78,7 +114,7 @@ async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
     const maybe = url.searchParams.get('maybe') === '1'
     const companyId = url.searchParams.get('companyId')
 
-    const where = ['c.watched = 1', 'p.closed_at IS NULL', `p.needs_triage = ${maybe ? 1 : 0}`]
+    const where = ['p.closed_at IS NULL', `p.needs_triage = ${maybe ? 1 : 0}`]
     const args: unknown[] = []
     if (roles.length > 0) {
       where.push(`p.role_type IN (${roles.map(() => '?').join(',')})`)
@@ -131,14 +167,17 @@ async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
         `SELECT p.id, p.company_id AS companyId, c.name AS companyName, p.title, p.location,
                 p.role_type AS roleType, p.apply_url AS applyUrl, p.posted_at AS postedAt,
                 p.first_seen_at AS firstSeenAt, p.closed_at AS closedAt, p.description,
-                p.app_status AS appStatus, p.app_note AS appNote, p.deadline
+                COALESCE(s.app_status, 'none') AS appStatus, s.app_note AS appNote
                 ${selectExtra.length ? ',' + selectExtra.join(',') : ''}
-         FROM postings p JOIN companies c ON c.id = p.company_id
+         FROM postings p
+         JOIN companies c ON c.id = p.company_id
+         JOIN user_companies uc ON uc.company_id = p.company_id AND uc.user_id = ?
+         LEFT JOIN user_posting_status s ON s.posting_id = p.id AND s.user_id = ?
          WHERE ${where.join(' AND ')}
          ORDER BY ${orderBy}
          LIMIT 500`
       )
-      .bind(...selectArgs, ...args, ...whereArgs)
+      .bind(...selectArgs, userId, userId, ...args, ...whereArgs)
       .all()
     return json(results ?? [])
   }
@@ -148,25 +187,27 @@ async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
     const body = (await req.json()) as { status?: string; note?: string }
     const allowed = ['none', 'interested', 'applied', 'interviewing', 'rejected', 'offer']
     if (!body.status || !allowed.includes(body.status)) return json({ error: 'bad status' }, 400)
-    await db
-      .prepare('UPDATE postings SET app_status = ?, app_updated_at = ?, app_note = COALESCE(?, app_note) WHERE id = ?')
-      .bind(body.status, new Date().toISOString(), body.note ?? null, id)
-      .run()
+    await setUserPostingStatus(db, userId, id, body.status, body.note ?? null)
     return json({ ok: true })
   }
 
   if (req.method === 'GET' && path === '/companies') {
-    return json(await listCompanies(db))
+    return json(await listCompaniesForUser(db, userId))
   }
 
   if (req.method === 'POST' && path === '/companies/watch') {
     const b = (await req.json()) as { id: number; watched: boolean }
-    await setWatched(db, b.id, b.watched)
+    if (b.watched) await addUserCompany(db, userId, b.id)
+    else await removeUserCompany(db, userId, b.id)
     return json({ ok: true })
   }
 
+  // Removes the company from THIS user's list only - the global company and
+  // its postings are never deleted, same "never delete" principle as
+  // everywhere else. If nobody else watches it, the cron simply stops
+  // fetching it; its history stays queryable.
   if (req.method === 'DELETE' && /^\/companies\/\d+$/.test(path)) {
-    await deleteCompany(db, Number(path.split('/')[2]))
+    await removeUserCompany(db, userId, Number(path.split('/')[2]))
     return json({ ok: true })
   }
 
@@ -209,8 +250,9 @@ async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
       const id = await upsertCompany(db, {
         name: known.name, careersUrl: known.careers_url, atsType: known.ats_type,
         boardToken: known.board_token, topics: JSON.parse(known.topics) as string[],
-        watched: true, source: 'directory'
+        source: 'directory'
       })
+      await addUserCompany(db, userId, id)
       return json({ ok: true, id, via: 'directory' })
     }
 
@@ -255,7 +297,6 @@ async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
       careersUrl: careersUrl || resolvedToken || 'https://example.invalid',
       atsType: resolvedAts ?? 'unknown',
       boardToken: resolvedToken ?? null,
-      watched: true,
       source: 'manual'
     })
 
@@ -277,6 +318,8 @@ async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
         .run()
     }
 
+    await addUserCompany(db, userId, id)
+
     const via = found ? 'probe' : scoutResult?.ok ? `scout-${scoutResult.tier}` : 'unresolved'
     return json({
       ok: true, id, via, atsType: resolvedAts ?? 'unknown',
@@ -287,15 +330,15 @@ async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
   }
 
   if (req.method === 'GET' && path === '/settings') {
-    return json(await getSettings(db, DEFAULT_SETTINGS))
+    return json(await getUserSettings(db, userId, DEFAULT_USER_SETTINGS))
   }
 
   if (req.method === 'PUT' && path === '/settings') {
     const patch = (await req.json()) as Record<string, unknown>
-    const allowed = Object.keys(DEFAULT_SETTINGS)
+    const allowed = Object.keys(DEFAULT_USER_SETTINGS)
     const clean: Record<string, unknown> = {}
     for (const k of allowed) if (k in patch) clean[k] = patch[k]
-    await setSettings(db, clean)
+    await setUserSettings(db, userId, clean)
     return json({ ok: true })
   }
 
@@ -313,12 +356,15 @@ export default {
     const url = new URL(req.url)
 
     if (url.pathname === '/health') return json({ ok: true })
+    if (url.pathname === '/api/auth/google' && req.method === 'POST') return await handleGoogleAuth(req, env)
 
     if (!url.pathname.startsWith('/api/')) return json({ error: 'not found' }, 404)
-    if (!authorized(req, env)) return json({ error: 'unauthorized' }, 401)
+
+    const user = await authenticate(req, env)
+    if (!user) return json({ error: 'unauthorized' }, 401)
 
     try {
-      return await handleApi(req, env, url)
+      return await handleApi(req, env, url, user)
     } catch (err) {
       return json({ error: err instanceof Error ? err.message : String(err) }, 500)
     }

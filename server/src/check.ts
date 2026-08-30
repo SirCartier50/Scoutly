@@ -1,28 +1,35 @@
 import { fetchCompany } from '../../src/core/connectors/index'
-import { applyFilters, classify, classifyPosting, maybePostings } from '../../src/core/classify'
+import { classify, classifyPosting, matchesLocation, functionAllowed, degreeRequirement, degreeAllowed } from '../../src/core/classify'
 import type { DegreeLevel, JobFunction } from '../../src/core/classify'
 import { runScout } from '../../src/core/agents/scout'
 import type { AtsType, RoleType } from '../../src/shared/types'
 import {
-  finishRun, listCompanies, markNotified, recordCheck, startRun, syncPostings,
-  unnotifiedPostings, getSettings, brokenCompanies, setConnector, recordAgentRun,
-  triageQueue, resolveTriage, closeStalePostings, type Env, type FetchedPosting
+  finishRun, distinctWatchedCompanies, markUserNotified, recordCheck, startRun, syncPostings,
+  unnotifiedPostingsForUser, usersWithWatches, getUserSettings, brokenCompanies, setConnector,
+  recordAgentRun, triageQueue, resolveTriage, closeStalePostings, type Env, type FetchedPosting
 } from './d1'
 import { sendDigest } from './email'
 
 /**
- * One check cycle.
+ * One check cycle, in two passes.
  *
- * Companies are processed in a bounded slice ordered by least-recently-checked,
- * not all at once: a Worker invocation has a CPU budget, and a user watching 300
- * companies would blow through it. With a small watch list every company is
- * checked every hour; with a large one they rotate fairly, and nothing is
- * silently skipped forever.
+ * Pass 1 (global, fetch/classify/store): companies are processed in a bounded
+ * slice ordered by least-recently-checked, not all at once - a Worker
+ * invocation has a CPU budget, and a user base watching hundreds of companies
+ * combined would blow through it. Every early-career-shaped posting is stored
+ * regardless of any one user's preferences: role-type/location/function/degree
+ * filtering is a per-user lens applied afterward, never baked into what gets
+ * fetched or kept. This is the load-bearing decision for multi-tenancy - N
+ * users watching the same company still cost ONE fetch, not N.
+ *
+ * Pass 2 (per-user, notify): each user who watches at least one company gets
+ * their own unnotified-postings query, filtered through THEIR settings, and
+ * their own digest email + notification bookkeeping.
  */
 const MAX_PER_RUN = 40
 const CONCURRENCY = 6
 
-export interface ServerSettings extends Record<string, unknown> {
+export interface UserSettings extends Record<string, unknown> {
   locations: string[]
   remoteOk: boolean
   wantIntern: boolean
@@ -30,17 +37,21 @@ export interface ServerSettings extends Record<string, unknown> {
   wantProgram: boolean
   functions: JobFunction[]
   degreeLevel: DegreeLevel | null
-  baselined: boolean
+  digestEmail: string | null
   /**
    * A posting this old gets auto-closed even if the company's feed still
    * lists it - applying to a 3-month-old req is a waste of time regardless of
    * whether the board bothered to take it down. Default matches how long a
-   * typical internship posting stays worth applying to.
+   * typical internship posting stays worth applying to. This one setting stays
+   * effectively global in practice (it drives a single shared closeStalePostings
+   * pass keyed off the first user's value would be wrong) - so it is read per
+   * user but the run just uses the most permissive (largest) value across all
+   * watching users, meaning no one's postings close earlier than they configured.
    */
   maxPostingAgeDays: number
 }
 
-export const DEFAULT_SETTINGS: ServerSettings = {
+export const DEFAULT_USER_SETTINGS: UserSettings = {
   locations: [],
   remoteOk: true,
   wantIntern: true,
@@ -48,7 +59,7 @@ export const DEFAULT_SETTINGS: ServerSettings = {
   wantProgram: true,
   functions: ['engineering', 'data'],
   degreeLevel: 'bachelors',
-  baselined: false,
+  digestEmail: null,
   maxPostingAgeDays: 90
 }
 
@@ -70,8 +81,7 @@ export interface RunSummary {
   checked: number
   newPostings: number
   errors: number
-  emailed: boolean
-  emailReason?: string
+  usersNotified: number
   healed: number
   triaged: number
   staleClosed: number
@@ -127,7 +137,7 @@ async function runMedic(env: Env, limit = 3): Promise<number> {
  *
  * Limit kept modest (each item is its own model-call subrequest) because this
  * shares Cloudflare's 50-subrequest-per-invocation ceiling (Free plan) with
- * the per-company fetch loop, Medic, and the digest email in the same run -
+ * the per-company fetch loop, Medic, and the digest emails in the same run -
  * a queue backlog should drain over a few hours, not risk starving the fetch
  * pass that actually matters.
  */
@@ -173,9 +183,9 @@ async function runTriage(env: Env, limit = 8): Promise<number> {
       const body = (await res.json()) as { choices?: { message?: { content?: string } }[] }
       const text = body.choices?.[0]?.message?.content ?? ''
       const parsed = JSON.parse(text) as { roleType?: string }
-      const valid: RoleType[] = ['intern', 'newgrad', 'program', 'other']
-      if (parsed.roleType && valid.includes(parsed.roleType as RoleType)) {
-        await resolveTriage(env.DB, item.id, parsed.roleType === 'other' ? null : (parsed.roleType as RoleType))
+      const valid = ['intern', 'newgrad', 'program', 'other']
+      if (parsed.roleType && valid.includes(parsed.roleType)) {
+        await resolveTriage(env.DB, item.id, parsed.roleType === 'other' ? null : (parsed.roleType as 'intern' | 'newgrad' | 'program'))
         resolved++
       }
     } catch {
@@ -188,9 +198,10 @@ async function runTriage(env: Env, limit = 8): Promise<number> {
 
 export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary> {
   const db = env.DB
-  const settings = await getSettings(db, DEFAULT_SETTINGS)
 
-  const all = await listCompanies(db, true)
+  /* --------------------------------------------------- pass 1: fetch/store */
+
+  const all = await distinctWatchedCompanies(db)
   // Least-recently-checked first, so rotation is fair and nothing starves.
   const slice = all
     .sort((a, b) => (a.last_ok_at ?? '').localeCompare(b.last_ok_at ?? ''))
@@ -226,46 +237,23 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
       }
 
       const classified = outcome.postings.map(classifyPosting)
-      const prefs = {
-        locations: settings.locations,
-        remoteOk: settings.remoteOk,
-        wantIntern: settings.wantIntern,
-        wantNewGrad: settings.wantNewGrad,
-        wantProgram: settings.wantProgram,
-        functions: settings.functions,
-        degreeLevel: settings.degreeLevel
-      }
 
-      const wanted = applyFilters(classified, prefs)
-      const maybes = maybePostings(classified, prefs)
-
-      const toStore: FetchedPosting[] = [
-        ...wanted.map((p) => ({
+      // Store everything early-career-shaped, unfiltered by any one user's
+      // preferences - filtering happens per-user at digest/read time instead.
+      const toStore: FetchedPosting[] = classified
+        .filter((p) => p.roleType !== 'other' || p.needsTriage)
+        .map((p) => ({
           externalId: p.externalId, title: p.title, location: p.location,
           applyUrl: p.applyUrl, postedAt: p.postedAt, description: p.description,
-          roleType: p.roleType, needsTriage: false
-        })),
-        // The "maybe" band is stored but flagged, so it can be reviewed without
-        // ever being emailed as if it were a confident match.
-        ...maybes.map((p) => ({
-          externalId: p.externalId, title: p.title, location: p.location,
-          applyUrl: p.applyUrl, postedAt: p.postedAt, description: p.description,
-          roleType: p.roleType, needsTriage: true
+          roleType: p.roleType, needsTriage: p.needsTriage
         }))
-      ]
 
       const res = await syncPostings(db, c.id, toStore)
       newCount += res.newPostings.length
 
-      // Health reflects whether the CONNECTOR is working, not whether the
-      // user's own filters happened to match anything this hour. A narrow
-      // filter (a specific degree level, a specific country) legitimately
-      // yields zero often - measuring health on that number made Palantir show
-      // "broken" with 65 real internships open, because "United States" as a
-      // location filter didn't literally appear in "Washington, D.C." style
-      // strings. Health is measured on the raw early-career count irrespective
-      // of the user's personal filters; toStore (used above) is what actually
-      // gets stored and emailed.
+      // Health reflects whether the CONNECTOR is working, not any user's
+      // personal filters - see the single-user version's note on why this
+      // caused false "broken" reads when measured post-filter instead.
       const rawEarlyCareerYield = classified.filter((p) => p.roleType !== 'other').length
 
       const history = JSON.parse(c.yield_history) as number[]
@@ -280,45 +268,57 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
   await Promise.all(Array.from({ length: CONCURRENCY }, worker))
   await finishRun(db, runId, { companiesChecked: slice.length, newPostings: newCount, errors })
 
-  // Auto-close anything past the age cutoff, even if the company's feed still
-  // lists it - some boards leave stale reqs up for months, and applying to a
-  // 3-month-old posting wastes the time this app exists to save. Runs once per
-  // cycle, independent of which companies happened to be in this run's slice,
-  // so a posting doesn't stay "open" for weeks just because its company wasn't
-  // due for a check.
-  const cutoff = new Date(Date.now() - settings.maxPostingAgeDays * 86_400_000).toISOString()
-  const staleClosed = await closeStalePostings(db, cutoff)
-
   // Medic and Triage run after the main fetch pass so they never compete with
   // it for the Worker's CPU budget, and Triage sees postings from THIS run.
   const healed = await runMedic(env)
   const triaged = await runTriage(env)
 
-  // The first run records what is already open without emailing about postings
-  // that predate the install.
-  const pending = await unnotifiedPostings(db)
-  if (!settings.baselined) {
-    await markNotified(db, pending.map((p) => p.id))
-    await import('./d1').then((m) => m.setSettings(db, { baselined: true }))
-    return {
-      runId, checked: slice.length, newPostings: newCount, errors,
-      emailed: false, emailReason: 'baseline run', healed, triaged, staleClosed
+  /* --------------------------------------------------- pass 2: per-user notify */
+
+  const users = await usersWithWatches(db)
+  let usersNotified = 0
+  let maxAgeDays = DEFAULT_USER_SETTINGS.maxPostingAgeDays
+
+  for (const user of users) {
+    const settings = await getUserSettings(db, user.id, DEFAULT_USER_SETTINGS)
+    maxAgeDays = Math.max(maxAgeDays, settings.maxPostingAgeDays)
+
+    const pending = await unnotifiedPostingsForUser(db, user.id)
+    if (pending.length === 0) continue
+
+    // Same building blocks applyFilters is made of, applied directly to the
+    // PendingNotification shape (which carries id/companyName that
+    // ClassifiedPosting doesn't) rather than round-tripping through it.
+    const wantedRoles = new Set<RoleType>()
+    if (settings.wantIntern) wantedRoles.add('intern')
+    if (settings.wantNewGrad) wantedRoles.add('newgrad')
+    if (settings.wantProgram) wantedRoles.add('program')
+
+    const matched = pending.filter((p) => {
+      if (!wantedRoles.has(p.roleType)) return false
+      if (!matchesLocation(p.location, settings.locations, settings.remoteOk)) return false
+      if (!functionAllowed(p.title, p.roleType, settings.functions)) return false
+      if (!degreeAllowed(degreeRequirement(p.title, p.description), settings.degreeLevel)) return false
+      return true
+    })
+    if (matched.length === 0) continue
+
+    const to = settings.digestEmail ?? user.email
+    const mail = await sendDigest(matched, { apiKey: env.RESEND_API_KEY, to })
+    // Only mark on success, so a mail outage retries instead of losing openings.
+    if (mail.sent) {
+      await markUserNotified(db, user.id, matched.map((p) => p.id))
+      usersNotified++
     }
   }
 
-  const mail = await sendDigest(pending, { apiKey: env.RESEND_API_KEY, to: env.DIGEST_TO })
-  // Only mark on success, so a mail outage retries instead of losing openings.
-  if (mail.sent) await markNotified(db, pending.map((p) => p.id))
+  // Auto-close anything past the age cutoff, even if the company's feed still
+  // lists it - some boards leave stale reqs up for months, and applying to a
+  // 3-month-old posting wastes the time this app exists to save. Runs once per
+  // cycle using the most permissive configured cutoff across all watching
+  // users, so no one's postings close earlier than they asked for.
+  const cutoff = new Date(Date.now() - maxAgeDays * 86_400_000).toISOString()
+  const staleClosed = await closeStalePostings(db, cutoff)
 
-  return {
-    runId,
-    checked: slice.length,
-    newPostings: newCount,
-    errors,
-    emailed: mail.sent,
-    emailReason: mail.reason,
-    healed,
-    triaged,
-    staleClosed
-  }
+  return { runId, checked: slice.length, newPostings: newCount, errors, usersNotified, healed, triaged, staleClosed }
 }
