@@ -26,9 +26,23 @@ crons = ["0 * * * *"]
 enabled = true
 
 # Secrets are set with `wrangler secret put NAME`, never committed:
-#   RESEND_API_KEY   - transactional email
-#   DIGEST_TO        - destination address
-#   CLIENT_TOKEN     - bearer token the desktop app presents (rotate before real use - shared in chat)
+#   RESEND_API_KEY   - transactional email (see server/src/email.ts's note on
+#                      the onboarding@resend.dev sandbox limitation - it can
+#                      only deliver to the Resend account's own verified
+#                      address until a sending domain is verified, which
+#                      matters now that digests go to real per-user addresses)
+#   GOOGLE_CLIENT_ID - OAuth client ID from Google Cloud Console; used to
+#                      verify the `aud` claim on every Google ID token
+#                      (server/src/auth.ts). The client SECRET lives only in
+#                      the Next.js web app (web/.env.local / Vercel project
+#                      settings), never here - this Worker never runs the
+#                      OAuth redirect flow itself.
 #   LLM_API_KEY      - optional, for Scout discovery
 #   LLM_BASE_URL     - optional, OpenAI-compatible endpoint
 #   LLM_MODEL        - optional, model id at that endpoint
+#
+# CLIENT_TOKEN is retired by the multi-tenant migration (0006) in favor of
+# per-user tokens issued via POST /api/auth/google - safe to delete once
+# nothing still depends on it: `wrangler secret delete CLIENT_TOKEN`.
+# The old value (6481c1b1...) has been visible in plaintext across dev/test
+# tool calls and should not be reused for anything else.
