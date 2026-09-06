@@ -6,32 +6,38 @@ import type { AtsType, RoleType } from '../../src/shared/types'
 import {
   finishRun, listAllCompanies, listAllUsers, markUserNotified, recordCheck, startRun, syncPostings,
   unnotifiedPostingsForUser, getUserSettings, brokenCompanies, setConnector,
-  recordAgentRun, triageQueue, resolveTriage, closeStalePostings, type Env, type FetchedPosting
+  recordAgentRun, triageQueue, resolveTriage, closeStalePostings, type CompanyRow, type Env, type FetchedPosting
 } from './d1'
 import { sendDigest } from './email'
 
 /**
- * One check cycle, in two passes.
+ * A check cycle is two independently-scheduled passes (see wrangler.toml),
+ * deliberately decoupled from each other rather than one big function:
  *
- * Pass 1 (global, fetch/classify/store): EVERY approved company is fetched
- * every run, not a slice - there is no per-user watch list gating which
- * companies matter, so cost depends only on the total company count, never
- * on how many users exist. N users still cost ONE fetch per company, not N.
- * Every early-career-shaped posting is stored regardless of any one user's
- * preferences: role-type/location/function/degree filtering is a per-user
- * lens applied afterward, never baked into what gets fetched or kept.
+ * Pass 1 (global, fetch/classify/store) - fans out over a queue instead of
+ * looping in one invocation. `enqueueFetchJobs` just reads the company list
+ * and enqueues one job per company (cheap, no fetching); `fetchAndStoreCompany`
+ * is what a queue consumer invocation runs per job, and Cloudflare runs many
+ * of those concurrently (up to 250). This is what lets the company count
+ * grow past a few hundred without hitting the 50 (Free) / 1000 (Paid)
+ * subrequest-per-invocation ceiling: cost still depends only on the total
+ * company count, never on user count (N users still cost ONE fetch per
+ * company, not N), but now it also doesn't depend on squeezing everything
+ * into a single invocation's budget. Every early-career-shaped posting is
+ * stored regardless of any one user's preferences - role-type/location/
+ * function/degree filtering is a per-user lens applied afterward, never
+ * baked into what gets fetched or kept.
  *
- * This is why the cron fires a few times a day (see wrangler.toml) rather
- * than hourly: covering the full company list in one invocation needs
- * Workers Paid's 1000-subrequest-per-invocation ceiling (Free is 50), and
- * running that many fetches a few times a day costs less overall than
- * spreading a smaller slice across 24 hourly runs would.
- *
- * Pass 2 (per-user, notify): every signed-up user gets their own
- * unnotified-postings query, filtered through THEIR settings, and their own
- * digest email + notification bookkeeping.
+ * Pass 2 (per-user, notify) - `runNotifyPass` runs on its own later cron,
+ * against whatever pass 1 has finished storing by then. No completion
+ * tracking between them: the queue is expected to have drained in the gap
+ * between the two cron times, and if a handful of the slowest companies
+ * land just after notify ran, they're simply picked up on the next pass -
+ * a fine trade against building distributed "is everyone done yet?"
+ * coordination for what is, in the end, a digest email.
  */
-const CONCURRENCY = 12
+/** Cloudflare's sendBatch() caps a single call at 100 messages. */
+const ENQUEUE_BATCH = 100
 
 export interface UserSettings extends Record<string, unknown> {
   locations: string[]
@@ -82,9 +88,6 @@ function evaluateHealth(yieldNow: number, history: number[], consecutiveZero: nu
 
 export interface RunSummary {
   runId: number
-  checked: number
-  newPostings: number
-  errors: number
   usersNotified: number
   healed: number
   triaged: number
@@ -200,83 +203,96 @@ async function runTriage(env: Env, limit = 8): Promise<number> {
   return resolved
 }
 
-export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary> {
+/**
+ * Producer: enqueues one fetch job per company. Deliberately does no
+ * fetching itself - this is meant to return fast regardless of how large
+ * the company list gets, since the actual work happens in many parallel
+ * consumer invocations of `fetchAndStoreCompany` below.
+ */
+export async function enqueueFetchJobs(env: Env): Promise<{ queued: number }> {
+  const companies = await listAllCompanies(env.DB)
+  for (let i = 0; i < companies.length; i += ENQUEUE_BATCH) {
+    await env.FETCH_QUEUE.sendBatch(
+      companies.slice(i, i + ENQUEUE_BATCH).map((c) => ({ body: { companyId: c.id } }))
+    )
+  }
+  return { queued: companies.length }
+}
+
+/**
+ * Consumer: fetches, classifies, and stores ONE company. Called once per
+ * queue message - see index.ts's `queue()` handler, which is what Cloudflare
+ * invokes concurrently across up to 250 parallel instances to drain the
+ * queue this enqueues into.
+ */
+export async function fetchAndStoreCompany(env: Env, companyId: number): Promise<void> {
   const db = env.DB
+  const c = await db.prepare('SELECT * FROM companies WHERE id = ?').bind(companyId).first<CompanyRow>()
+  // Deleted between enqueue and processing (or never existed) - nothing to do.
+  if (!c) return
 
-  /* --------------------------------------------------- pass 1: fetch/store */
+  const outcome = await fetchCompany({
+    id: c.id,
+    name: c.name,
+    careersUrl: c.careers_url,
+    atsType: c.ats_type as AtsType,
+    boardToken: c.board_token,
+    parseConfig: c.parse_config ? JSON.parse(c.parse_config) : null
+  })
 
-  const all = await listAllCompanies(db)
-
-  const runId = await startRun(db, kind)
-  let newCount = 0
-  let errors = 0
-
-  const queue = [...all]
-  const worker = async (): Promise<void> => {
-    while (queue.length > 0) {
-      const c = queue.shift()
-      if (!c) return
-
-      const outcome = await fetchCompany({
-        id: c.id,
-        name: c.name,
-        careersUrl: c.careers_url,
-        atsType: c.ats_type as AtsType,
-        boardToken: c.board_token,
-        parseConfig: c.parse_config ? JSON.parse(c.parse_config) : null
-      })
-
-      if (!outcome.ok) {
-        errors++
-        await recordCheck(db, c.id, {
-          ok: false,
-          error: outcome.error,
-          health: outcome.transient ? 'stale' : 'broken'
-        })
-        continue
-      }
-
-      const classified = outcome.postings.map(classifyPosting)
-
-      // Store everything early-career-shaped, unfiltered by any one user's
-      // preferences - filtering happens per-user at digest/read time instead.
-      const toStore: FetchedPosting[] = classified
-        .filter((p) => p.roleType !== 'other' || p.needsTriage)
-        .map((p) => ({
-          externalId: p.externalId, title: p.title, location: p.location,
-          applyUrl: p.applyUrl, postedAt: p.postedAt, description: p.description,
-          roleType: p.roleType, needsTriage: p.needsTriage
-        }))
-
-      const res = await syncPostings(db, c.id, toStore)
-      newCount += res.newPostings.length
-
-      // Health reflects whether the CONNECTOR is working, not any user's
-      // personal filters - see the single-user version's note on why this
-      // caused false "broken" reads when measured post-filter instead.
-      const rawEarlyCareerYield = classified.filter((p) => p.roleType !== 'other').length
-
-      const history = JSON.parse(c.yield_history) as number[]
-      await recordCheck(db, c.id, {
-        ok: true,
-        yield: rawEarlyCareerYield,
-        health: evaluateHealth(rawEarlyCareerYield, history, c.consecutive_zero)
-      })
-    }
+  if (!outcome.ok) {
+    await recordCheck(db, c.id, {
+      ok: false,
+      error: outcome.error,
+      health: outcome.transient ? 'stale' : 'broken'
+    })
+    return
   }
 
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker))
-  await finishRun(db, runId, { companiesChecked: all.length, newPostings: newCount, errors })
+  const classified = outcome.postings.map(classifyPosting)
 
-  // Medic and Triage run after the main fetch pass so they never compete with
-  // it for the Worker's CPU budget, and Triage sees postings from THIS run.
+  // Store everything early-career-shaped, unfiltered by any one user's
+  // preferences - filtering happens per-user at digest/read time instead.
+  const toStore: FetchedPosting[] = classified
+    .filter((p) => p.roleType !== 'other' || p.needsTriage)
+    .map((p) => ({
+      externalId: p.externalId, title: p.title, location: p.location,
+      applyUrl: p.applyUrl, postedAt: p.postedAt, description: p.description,
+      roleType: p.roleType, needsTriage: p.needsTriage
+    }))
+
+  await syncPostings(db, c.id, toStore)
+
+  // Health reflects whether the CONNECTOR is working, not any user's
+  // personal filters - see the single-user version's note on why this
+  // caused false "broken" reads when measured post-filter instead.
+  const rawEarlyCareerYield = classified.filter((p) => p.roleType !== 'other').length
+
+  const history = JSON.parse(c.yield_history) as number[]
+  await recordCheck(db, c.id, {
+    ok: true,
+    yield: rawEarlyCareerYield,
+    health: evaluateHealth(rawEarlyCareerYield, history, c.consecutive_zero)
+  })
+}
+
+/**
+ * The per-user notify pass: runs independently of the fetch queue (see the
+ * doc comment above), against whatever's already stored by the time this
+ * fires. Also where Medic and Triage run, since neither depends on which
+ * companies happened to be in this cycle's fetch batch - they query fresh
+ * (brokenCompanies, triageQueue) regardless of what triggered this pass.
+ */
+export async function runNotifyPass(env: Env, kind = 'scheduled'): Promise<RunSummary> {
+  const db = env.DB
+  const runId = await startRun(db, kind)
+
   const healed = await runMedic(env)
   const triaged = await runTriage(env)
 
-  /* --------------------------------------------------- pass 2: per-user notify */
-
   const users = await listAllUsers(db)
   let usersNotified = 0
+  let totalSent = 0
   let maxAgeDays = DEFAULT_USER_SETTINGS.maxPostingAgeDays
 
   for (const user of users) {
@@ -309,6 +325,7 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
     if (mail.sent) {
       await markUserNotified(db, user.id, matched.map((p) => p.id))
       usersNotified++
+      totalSent += matched.length
     }
   }
 
@@ -320,5 +337,7 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
   const cutoff = new Date(Date.now() - maxAgeDays * 86_400_000).toISOString()
   const staleClosed = await closeStalePostings(db, cutoff)
 
-  return { runId, checked: all.length, newPostings: newCount, errors, usersNotified, healed, triaged, staleClosed }
+  await finishRun(db, runId, { companiesChecked: users.length, newPostings: totalSent, errors: 0 })
+
+  return { runId, usersNotified, healed, triaged, staleClosed }
 }

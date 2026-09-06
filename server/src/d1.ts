@@ -18,6 +18,11 @@ import type { BrowserWorker } from '@cloudflare/puppeteer'
  * storage.
  */
 
+/** One job per company - the producer enqueues these, the consumer fetches just this one. */
+export interface FetchJob {
+  companyId: number
+}
+
 export interface Env {
   DB: D1Database
   RESEND_API_KEY?: string
@@ -28,6 +33,7 @@ export interface Env {
   LLM_ESCALATION_MODEL?: string
   GOOGLE_CLIENT_ID?: string
   BROWSER?: BrowserWorker
+  FETCH_QUEUE: Queue<FetchJob>
 }
 
 const now = (): string => new Date().toISOString()

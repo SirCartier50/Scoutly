@@ -12,15 +12,39 @@ database_id = "41baea19-f7ec-4180-8246-4a485ed57390"
 
 # Real Chromium, used ONLY for one-off discovery of hard custom career sites
 # (e.g. Google's SPA has zero job data in its raw HTML - it only exists after
-# JS runs). Never used by the recurring hourly check, which must stay a plain
-# fetch: fast, free, and not competing for the free tier's 10 browser-min/day.
+# JS runs). Never used by the recurring check, which must stay a plain fetch:
+# fast, free, and not competing for the free tier's 10 browser-min/day.
 [browser]
 binding = "BROWSER"
 
-# Hourly, so a posting that appears at 10am is emailed by 11am rather than
-# waiting for the machine to be switched on.
+# Fan-out for the company fetch: one queue message per company rather than
+# one big loop inside a single invocation. This is what lets the company
+# list grow past a few hundred without hitting the 50 (Free) / 1000 (Paid)
+# subrequest-per-invocation ceiling - Cloudflare runs up to 250 consumer
+# invocations concurrently, each handling a small batch, so total throughput
+# scales with concurrency instead of needing ever-bigger single invocations.
+# Requires the queue to exist first: `wrangler queues create career-watch-fetch`.
+[[queues.producers]]
+queue = "career-watch-fetch"
+binding = "FETCH_QUEUE"
+
+[[queues.consumers]]
+queue = "career-watch-fetch"
+max_batch_size = 10
+max_batch_timeout = 5
+max_retries = 3
+max_concurrency = 25
+
+# Two crons, deliberately decoupled rather than one: ENQUEUE_CRON fans the
+# fetch out to the queue (cheap - no fetching happens here); the second,
+# 30 minutes later, runs the per-user notify pass against whatever the queue
+# has finished storing by then. No completion-tracking between them - a
+# handful of the slowest companies landing just after the notify pass ran
+# simply get picked up on the NEXT pass, which is a fine trade for not
+# building a distributed "is everyone done yet?" check for a job digest.
+# Update ENQUEUE_CRON in index.ts if this first entry ever moves.
 [triggers]
-crons = ["0 * * * *"]
+crons = ["0 */6 * * *", "30 */6 * * *"]
 
 [observability]
 enabled = true

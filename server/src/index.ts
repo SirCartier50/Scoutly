@@ -1,10 +1,16 @@
 import { registerWorkerHtmlParser } from './htmlParser'
-import { runCheck, DEFAULT_USER_SETTINGS } from './check'
+import { enqueueFetchJobs, fetchAndStoreCompany, runNotifyPass, DEFAULT_USER_SETTINGS } from './check'
 import { verifyGoogleIdToken } from './auth'
 import {
   authenticateToken, getUserSettings, issueToken, listAllCompanies,
-  requestCompany, setUserPostingStatus, setUserSettings, upsertUser, type Env, type UserRow
+  requestCompany, setUserPostingStatus, setUserSettings, upsertUser,
+  type Env, type FetchJob, type UserRow
 } from './d1'
+
+// Must match wrangler.toml's `[triggers].crons` first entry - the scheduled
+// handler below uses this to tell the enqueue cron apart from the notify one,
+// since Cloudflare fires the same scheduled() for every cron on this Worker.
+const ENQUEUE_CRON = '0 */6 * * *'
 
 registerWorkerHtmlParser()
 
@@ -215,8 +221,17 @@ async function handleApi(req: Request, env: Env, url: URL, user: UserRow): Promi
     return json({ ok: true })
   }
 
+  // Enqueues the fetch fan-out; does not wait for it to drain (see check.ts's
+  // doc comment on why fetch and notify are two independent passes now).
   if (req.method === 'POST' && path === '/check') {
-    return json(await runCheck(env, 'manual'))
+    return json(await enqueueFetchJobs(env))
+  }
+
+  // Runs the per-user notify pass immediately against whatever's already
+  // stored, rather than waiting for its own later cron - useful for testing
+  // and for a "send me what's ready now" manual trigger.
+  if (req.method === 'POST' && path === '/notify') {
+    return json(await runNotifyPass(env, 'manual'))
   }
 
   return json({ error: 'not found' }, 404)
@@ -243,13 +258,34 @@ export default {
     }
   },
 
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Cloudflare fires this same handler for every cron on the Worker -
+    // event.cron is how it tells the two apart (see wrangler.toml).
+    const isEnqueue = event.cron === ENQUEUE_CRON
     // waitUntil keeps the invocation alive for the async work after the handler
     // returns, which is how scheduled Workers are meant to do I/O.
     ctx.waitUntil(
-      runCheck(env, 'scheduled')
-        .then((s) => console.log('[cron]', JSON.stringify(s)))
-        .catch((e) => console.error('[cron] failed', e))
+      (isEnqueue ? enqueueFetchJobs(env) : runNotifyPass(env, 'scheduled'))
+        .then((s) => console.log(`[cron:${isEnqueue ? 'enqueue' : 'notify'}]`, JSON.stringify(s)))
+        .catch((e) => console.error(`[cron:${isEnqueue ? 'enqueue' : 'notify'}] failed`, e))
     )
+  },
+
+  /**
+   * Drains the fetch queue. Cloudflare runs many invocations of this
+   * concurrently (up to max_concurrency in wrangler.toml) to process
+   * different batches at once - see check.ts's doc comment on why this is
+   * what actually lets the company count scale past a few hundred.
+   */
+  async queue(batch: MessageBatch<FetchJob>, env: Env): Promise<void> {
+    for (const msg of batch.messages) {
+      try {
+        await fetchAndStoreCompany(env, msg.body.companyId)
+        msg.ack()
+      } catch (err) {
+        console.error('[queue] fetch failed for company', msg.body.companyId, err)
+        msg.retry()
+      }
+    }
   }
 }

@@ -78,10 +78,13 @@ export default function Dashboard() {
   const [settings, setSettings] = useState<Settings | null>(null)
   const [roleFilter, setRoleFilter] = useState<RoleType[]>([])
   const [search, setSearch] = useState('')
-  const [newCompanyName, setNewCompanyName] = useState('')
-  const [newCompanyUrl, setNewCompanyUrl] = useState('')
+  const [companySearch, setCompanySearch] = useState('')
+  const [requestName, setRequestName] = useState('')
+  const [requestUrl, setRequestUrl] = useState('')
+  const [requestResult, setRequestResult] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [checkResult, setCheckResult] = useState<string | null>(null)
+  const [notifyResult, setNotifyResult] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const loadAll = useCallback(async () => {
@@ -109,29 +112,24 @@ export default function Dashboard() {
     void loadAll()
   }, [loadAll])
 
-  const addCompany = async (e: React.FormEvent) => {
+  // Every user gets every approved company automatically - there's no
+  // "add to my list" anymore. A missing company becomes a request that gets
+  // verified before it's ever added for everyone, the same standard used to
+  // fix Uber's wrong ATS match rather than trusting an automatic result.
+  const requestCompanyTicket = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!newCompanyName.trim()) return
+    if (!requestName.trim()) return
     setBusy(true)
+    setRequestResult(null)
     try {
-      await cw('/companies/add', {
+      await cw('/companies/request', {
         method: 'POST',
-        body: JSON.stringify({ name: newCompanyName.trim(), careersUrl: newCompanyUrl.trim() || undefined })
+        body: JSON.stringify({ name: requestName.trim(), careersUrl: requestUrl.trim() || undefined })
       })
-      setNewCompanyName(''); setNewCompanyUrl('')
-      await loadAll()
+      setRequestResult(`Requested "${requestName.trim()}" - we'll verify it and add it for everyone.`)
+      setRequestName(''); setRequestUrl('')
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const removeCompany = async (id: number) => {
-    setBusy(true)
-    try {
-      await cw(`/companies/${id}`, { method: 'DELETE' })
-      await loadAll()
+      setRequestResult(err instanceof Error ? err.message : String(err))
     } finally {
       setBusy(false)
     }
@@ -153,15 +151,32 @@ export default function Dashboard() {
     }
   }
 
+  // Just enqueues the fetch fan-out - it doesn't wait for it to drain, since
+  // that now happens across many parallel queue consumers, not in this
+  // request. See check.ts's doc comment for why fetch and notify are two
+  // independent passes.
   const runCheck = async () => {
     setBusy(true)
     setCheckResult(null)
     try {
-      const res = await cw<{ checked: number; newPostings: number; usersNotified: number }>('/check', { method: 'POST' })
-      setCheckResult(`Checked ${res.checked} compan${res.checked === 1 ? 'y' : 'ies'}, ${res.newPostings} new posting(s).`)
-      await loadAll()
+      const res = await cw<{ queued: number }>('/check', { method: 'POST' })
+      setCheckResult(`Queued ${res.queued} compan${res.queued === 1 ? 'y' : 'ies'} for fetching.`)
     } catch (err) {
       setCheckResult(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const runNotify = async () => {
+    setBusy(true)
+    setNotifyResult(null)
+    try {
+      const res = await cw<{ usersNotified: number }>('/notify', { method: 'POST' })
+      setNotifyResult(`Sent digests to ${res.usersNotified} user${res.usersNotified === 1 ? '' : 's'}.`)
+      await loadAll()
+    } catch (err) {
+      setNotifyResult(err instanceof Error ? err.message : String(err))
     } finally {
       setBusy(false)
     }
@@ -187,30 +202,45 @@ export default function Dashboard() {
         />
       </section>
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <button
           onClick={runCheck}
           disabled={busy}
-          className="rounded-md bg-white px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-neutral-200 disabled:opacity-50"
+          className="rounded-md border border-neutral-700 px-4 py-2 text-sm hover:bg-neutral-900 disabled:opacity-50"
         >
           Check now
         </button>
         {checkResult && <span className="text-sm text-neutral-400">{checkResult}</span>}
+        <button
+          onClick={runNotify}
+          disabled={busy}
+          className="rounded-md bg-white px-4 py-2 text-sm font-medium text-neutral-900 hover:bg-neutral-200 disabled:opacity-50"
+        >
+          Send digest now
+        </button>
+        {notifyResult && <span className="text-sm text-neutral-400">{notifyResult}</span>}
       </div>
 
       {/* ----------------------------------------------------- companies */}
       <section>
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-neutral-400">Companies</h2>
-        <form onSubmit={addCompany} className="mb-4 flex flex-wrap gap-2">
+        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-neutral-400">
+          Companies <span className="text-neutral-500">({companies.length} watched for everyone)</span>
+        </h2>
+        <p className="mb-3 text-sm text-neutral-400">
+          Every company here is fetched for you automatically - filter what you actually want to see over in{' '}
+          <span className="text-neutral-200">Postings</span> below. Don&apos;t see a company you&apos;re
+          expecting? Request it and we&apos;ll verify and add it for everyone.
+        </p>
+        <form onSubmit={requestCompanyTicket} className="mb-4 flex flex-wrap gap-2">
           <input
-            value={newCompanyName}
-            onChange={(e) => setNewCompanyName(e.target.value)}
+            value={requestName}
+            onChange={(e) => setRequestName(e.target.value)}
             placeholder="Company name"
             className="flex-1 min-w-[160px] rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm"
           />
           <input
-            value={newCompanyUrl}
-            onChange={(e) => setNewCompanyUrl(e.target.value)}
+            value={requestUrl}
+            onChange={(e) => setRequestUrl(e.target.value)}
             placeholder="Careers URL (optional)"
             className="flex-1 min-w-[200px] rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm"
           />
@@ -219,29 +249,40 @@ export default function Dashboard() {
             disabled={busy}
             className="rounded-md border border-neutral-700 px-4 py-2 text-sm hover:bg-neutral-900 disabled:opacity-50"
           >
-            Add
+            Request
           </button>
         </form>
+        {requestResult && <p className="mb-3 text-sm text-neutral-400">{requestResult}</p>}
+
+        <input
+          value={companySearch}
+          onChange={(e) => setCompanySearch(e.target.value)}
+          placeholder={`Search ${companies.length} companies…`}
+          className="mb-3 w-full rounded-md border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-sm"
+        />
         <ul className="divide-y divide-neutral-800 overflow-hidden rounded-md border border-neutral-800">
-          {companies.map((c) => (
-            <li key={c.id} className="flex items-center justify-between gap-2 px-4 py-2.5 text-sm">
-              <div
-                className="min-w-0 flex-1 truncate"
-                title={`${c.name} · ${c.ats_type} · ${c.health}${c.last_error ? ` · ${c.last_error}` : ''}`}
-              >
-                <span className="font-medium">{c.name}</span>{' '}
-                <span className="text-neutral-500">
-                  · {c.ats_type} · <HealthDot health={c.health} /> {c.health}
-                  {c.last_error ? ` · ${c.last_error}` : ''}
-                </span>
-              </div>
-              <button onClick={() => removeCompany(c.id)} className="shrink-0 text-neutral-500 hover:text-red-400">
-                Remove
-              </button>
-            </li>
-          ))}
-          {companies.length === 0 && <li className="px-4 py-6 text-center text-sm text-neutral-500">No companies watched yet.</li>}
+          {companies
+            .filter((c) => c.name.toLowerCase().includes(companySearch.trim().toLowerCase()))
+            .slice(0, 200)
+            .map((c) => (
+              <li key={c.id} className="flex items-center justify-between gap-2 px-4 py-2.5 text-sm">
+                <div
+                  className="min-w-0 flex-1 truncate"
+                  title={`${c.name} · ${c.ats_type} · ${c.health}${c.last_error ? ` · ${c.last_error}` : ''}`}
+                >
+                  <span className="font-medium">{c.name}</span>{' '}
+                  <span className="text-neutral-500">
+                    · {c.ats_type} · <HealthDot health={c.health} /> {c.health}
+                    {c.last_error ? ` · ${c.last_error}` : ''}
+                  </span>
+                </div>
+              </li>
+            ))}
+          {companies.length === 0 && <li className="px-4 py-6 text-center text-sm text-neutral-500">Loading…</li>}
         </ul>
+        {companies.filter((c) => c.name.toLowerCase().includes(companySearch.trim().toLowerCase())).length > 200 && (
+          <p className="mt-2 text-xs text-neutral-500">Showing the first 200 matches - narrow your search to see more.</p>
+        )}
       </section>
 
       {/* ------------------------------------------------------ postings */}
