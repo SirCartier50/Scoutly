@@ -222,17 +222,20 @@ export default function Dashboard() {
             Add
           </button>
         </form>
-        <ul className="divide-y divide-neutral-800 rounded-md border border-neutral-800">
+        <ul className="divide-y divide-neutral-800 overflow-hidden rounded-md border border-neutral-800">
           {companies.map((c) => (
-            <li key={c.id} className="flex items-center justify-between px-4 py-2.5 text-sm">
-              <div>
+            <li key={c.id} className="flex items-center justify-between gap-2 px-4 py-2.5 text-sm">
+              <div
+                className="min-w-0 flex-1 truncate"
+                title={`${c.name} · ${c.ats_type} · ${c.health}${c.last_error ? ` · ${c.last_error}` : ''}`}
+              >
                 <span className="font-medium">{c.name}</span>{' '}
                 <span className="text-neutral-500">
                   · {c.ats_type} · <HealthDot health={c.health} /> {c.health}
                   {c.last_error ? ` · ${c.last_error}` : ''}
                 </span>
               </div>
-              <button onClick={() => removeCompany(c.id)} className="text-neutral-500 hover:text-red-400">
+              <button onClick={() => removeCompany(c.id)} className="shrink-0 text-neutral-500 hover:text-red-400">
                 Remove
               </button>
             </li>
@@ -263,14 +266,20 @@ export default function Dashboard() {
             className="ml-auto min-w-[220px] rounded-md border border-neutral-700 bg-neutral-900 px-3 py-1.5 text-sm"
           />
         </div>
-        <ul className="divide-y divide-neutral-800 rounded-md border border-neutral-800">
+        <ul className="divide-y divide-neutral-800 overflow-hidden rounded-md border border-neutral-800">
           {postings.map((p) => (
-            <li key={p.id} className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 text-sm">
-              <div className="min-w-0">
-                <a href={p.applyUrl} target="_blank" rel="noreferrer" className="font-medium hover:underline">
+            <li key={p.id} className="flex items-center justify-between gap-2 px-4 py-3 text-sm">
+              <div className="min-w-0 flex-1">
+                <a
+                  href={p.applyUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block truncate font-medium hover:underline"
+                  title={p.title}
+                >
                   {p.title}
                 </a>
-                <div className="text-neutral-500">
+                <div className="truncate text-neutral-500" title={`${p.companyName} · ${ROLE_LABEL[p.roleType]}${p.location ? ` · ${p.location}` : ''}`}>
                   {p.companyName} · {ROLE_LABEL[p.roleType]}
                   {p.location ? ` · ${p.location}` : ''}
                 </div>
@@ -278,7 +287,7 @@ export default function Dashboard() {
               <select
                 value={p.appStatus}
                 onChange={(e) => setPostingStatus(p.id, e.target.value as AppStatus)}
-                className="rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs"
+                className="shrink-0 rounded-md border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs"
               >
                 {STATUS_OPTIONS.map((s) => (
                   <option key={s} value={s}>{s}</option>
