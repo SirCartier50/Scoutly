@@ -6,6 +6,7 @@ export type AtsType =
   | 'ashby'
   | 'smartrecruiters'
   | 'workday'
+  | 'oraclehcm'
   | 'careerpage'
   // Dedicated connectors for specific large employers whose custom in-house
   // systems have a real, reverse-engineered JSON endpoint. Unlike the generic

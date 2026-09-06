@@ -271,6 +271,85 @@ export const workday: Connector = {
   }
 }
 
+/* -------------------------------------------------------------- oraclehcm */
+
+interface OracleReq {
+  Id: string
+  Title: string
+  PostedDate?: string | null
+  PrimaryLocation?: string | null
+}
+interface OracleSearchItem {
+  requisitionList?: OracleReq[]
+  TotalJobsCount?: number
+}
+
+/**
+ * Oracle Fusion Cloud Recruiting ("Candidate Experience") - a generic
+ * enterprise ATS, same category as Workday: many unrelated companies run
+ * their own tenant of it. Found on Uber's career site (jobs.uber.com links
+ * out to <pod>.fa.ocs.oraclecloud.com) by inspecting network traffic, same
+ * way as Workday and the dedicated big-company connectors.
+ *
+ * Unlike Workday's POST-based CXS endpoint, this is a plain public GET REST
+ * API (recruitingCEJobRequisitions) - no auth, no CSRF token, and it accepts
+ * an `offset` inside the `finder` param for pagination.
+ *
+ * board_token packs three tenant-specific values that can't be derived from
+ * each other: `<host>|<siteNumber>|<siteName>` - e.g.
+ * `iaziqy.fa.ocs.oraclecloud.com|CX_1|UberCareers`. siteNumber selects the
+ * search results (`finder=findReqs;siteNumber=...`); siteName is the path
+ * segment the public job-detail/apply page lives under.
+ */
+export const oraclehcm: Connector = {
+  type: 'oraclehcm',
+  async fetch(t) {
+    const token = t.boardToken
+    if (!token) throw new HttpError('oraclehcm connector requires a board token', null, false)
+    const [host, siteNumber, siteName] = token.split('|')
+    if (!host || !siteNumber || !siteName) {
+      throw new HttpError('oraclehcm board token must be "<host>|<siteNumber>|<siteName>"', null, false)
+    }
+
+    const out: RawPosting[] = []
+    const limit = 200
+
+    for (let page = 0; page < 25; page++) {
+      const offset = page * limit
+      const finder =
+        `findReqs;siteNumber=${encodeURIComponent(siteNumber)},limit=${limit},offset=${offset},sortBy=POSTING_DATES_DESC`
+      const url =
+        `https://${host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions` +
+        `?onlyData=true&expand=requisitionList&finder=${encodeURIComponent(finder)}`
+
+      const body = await getJson<{ items?: OracleSearchItem[] }>(url)
+      const item = body.items?.[0]
+      const batch = item?.requisitionList ?? []
+
+      for (const r of batch) {
+        out.push({
+          externalId: r.Id,
+          title: r.Title ?? '(untitled)',
+          location: str(r.PrimaryLocation),
+          applyUrl: `https://${host}/hcmUI/CandidateExperience/en/sites/${encodeURIComponent(siteName)}/job/${encodeURIComponent(r.Id)}`,
+          // The board's own posted date - trustworthy, not fabricated.
+          postedAt: str(r.PostedDate),
+          // Full descriptions live behind a separate per-job detail call the
+          // list endpoint doesn't include; left null on the index pass like
+          // every other connector's "content" hydration.
+          description: null,
+          department: null
+        })
+      }
+
+      if (batch.length < limit) break
+      if (item?.TotalJobsCount && offset + batch.length >= item.TotalJobsCount) break
+    }
+
+    return out
+  }
+}
+
 /* ---------------------------------------------------------------- careerpage */
 
 function pluck(obj: unknown, path: string): unknown {
@@ -759,6 +838,7 @@ const REGISTRY: Partial<Record<AtsType, Connector>> = {
   ashby,
   smartrecruiters,
   workday,
+  oraclehcm,
   careerpage,
   amazonjobs,
   microsoftjobs,

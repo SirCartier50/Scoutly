@@ -21,7 +21,7 @@ export interface ProbeResult {
 }
 
 const ENDPOINTS: Record<
-  Exclude<AtsType, 'workday' | 'careerpage' | 'amazonjobs' | 'microsoftjobs' | 'googlejobs' | 'applejobs' | 'unknown'>,
+  Exclude<AtsType, 'workday' | 'oraclehcm' | 'careerpage' | 'amazonjobs' | 'microsoftjobs' | 'googlejobs' | 'applejobs' | 'unknown'>,
   { url: (t: string) => string; count: (j: unknown) => number | null }
 > = {
   greenhouse: {
@@ -93,7 +93,7 @@ export async function probeCareerPage(careersUrl: string): Promise<ProbeResult |
     const m = re.exec(html)
     const token = m?.[1]
     if (!token) continue
-    if (ats === 'workday' || ats === 'careerpage' || ats === 'amazonjobs' || ats === 'microsoftjobs' || ats === 'googlejobs' || ats === 'applejobs' || ats === 'unknown') continue
+    if (ats === 'workday' || ats === 'oraclehcm' || ats === 'careerpage' || ats === 'amazonjobs' || ats === 'microsoftjobs' || ats === 'googlejobs' || ats === 'applejobs' || ats === 'unknown') continue
 
     const n = await tryEndpoint(ats, token)
     if (n !== null) return { atsType: ats, boardToken: token, jobCount: n, via: 'page-link' }
