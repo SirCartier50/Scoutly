@@ -32,6 +32,20 @@ export interface Env {
 
 const now = (): string => new Date().toISOString()
 
+/**
+ * D1.batch() shares SQLite's bound-parameter ceiling (999) across the WHOLE
+ * batch, not per statement - a single call built from an unbounded row count
+ * (every posting on a big board, a user's entire first-ever unnotified
+ * backlog) can blow past it silently until it doesn't. Chunked defensively
+ * wherever the statement count scales with live data rather than a small
+ * fixed set (e.g. settings keys, which stay tiny and skip this).
+ */
+async function batchChunked(db: D1Database, statements: D1PreparedStatement[], chunkSize = 80): Promise<void> {
+  for (let i = 0; i < statements.length; i += chunkSize) {
+    await db.batch(statements.slice(i, i + chunkSize))
+  }
+}
+
 export function slugify(name: string): string {
   return name
     .toLowerCase()
@@ -51,22 +65,47 @@ export interface UserRow {
   created_at: string
 }
 
+/**
+ * Upserts a user by Google sub. On a genuinely NEW user, also seeds a
+ * notification baseline across every currently-open posting - otherwise
+ * their very first digest would be the entire historical backlog across
+ * every company, since companies are no longer individually opted into.
+ * Same "first run baselines silently" principle as the old single-user
+ * version, just scoped to (this new user) instead of (the whole app).
+ */
 export async function upsertUser(
   db: D1Database,
   u: { googleSub: string; email: string; name?: string | null; pictureUrl?: string | null }
 ): Promise<UserRow> {
+  const existing = await db.prepare('SELECT * FROM users WHERE google_sub = ?').bind(u.googleSub).first<UserRow>()
+
+  if (existing) {
+    await db
+      .prepare('UPDATE users SET email = ?, name = ?, picture_url = ? WHERE id = ?')
+      .bind(u.email, u.name ?? null, u.pictureUrl ?? null, existing.id)
+      .run()
+    return { ...existing, email: u.email, name: u.name ?? null, picture_url: u.pictureUrl ?? null }
+  }
+
   await db
-    .prepare(
-      `INSERT INTO users (google_sub, email, name, picture_url, created_at)
-       VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(google_sub) DO UPDATE SET
-         email = excluded.email, name = excluded.name, picture_url = excluded.picture_url`
-    )
+    .prepare('INSERT INTO users (google_sub, email, name, picture_url, created_at) VALUES (?, ?, ?, ?, ?)')
     .bind(u.googleSub, u.email, u.name ?? null, u.pictureUrl ?? null, now())
     .run()
 
   const row = await db.prepare('SELECT * FROM users WHERE google_sub = ?').bind(u.googleSub).first<UserRow>()
-  if (!row) throw new Error('user upsert failed')
+  if (!row) throw new Error('user insert failed')
+
+  const { results: open } = await db
+    .prepare('SELECT id FROM postings WHERE closed_at IS NULL')
+    .all<{ id: number }>()
+  if (open && open.length > 0) {
+    const ts = now()
+    const stmt = db.prepare(
+      'INSERT INTO user_posting_notifications (user_id, posting_id, notified_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING'
+    )
+    await batchChunked(db, open.map((p) => stmt.bind(row.id, p.id, ts)))
+  }
+
   return row
 }
 
@@ -123,36 +162,16 @@ export interface CompanyRow {
   created_at: string
 }
 
-/** Every company ever added by anyone, global admin/debug view. */
+/**
+ * Every approved company - the same list for every user, fetched by the
+ * cron and visible to every signed-in user. There is no per-user selection
+ * anymore: the whole point of this app is to never depend on a user
+ * remembering to add a company that's already known. Personalization lives
+ * entirely in user_settings (Postings-tab filtering) and user_posting_status
+ * (application tracking), never in which companies exist for a given user.
+ */
 export async function listAllCompanies(db: D1Database): Promise<CompanyRow[]> {
   const { results } = await db.prepare('SELECT * FROM companies ORDER BY name').all<CompanyRow>()
-  return results ?? []
-}
-
-/** Companies on THIS user's watch list. */
-export async function listCompaniesForUser(db: D1Database, userId: number): Promise<CompanyRow[]> {
-  const { results } = await db
-    .prepare(
-      `SELECT c.* FROM companies c
-       JOIN user_companies uc ON uc.company_id = c.id
-       WHERE uc.user_id = ? ORDER BY c.name`
-    )
-    .bind(userId)
-    .all<CompanyRow>()
-  return results ?? []
-}
-
-/**
- * Companies watched by at least one user. This is what the hourly cron fetch
- * loop iterates - one fetch per company regardless of watcher count.
- */
-export async function distinctWatchedCompanies(db: D1Database): Promise<CompanyRow[]> {
-  const { results } = await db
-    .prepare(
-      `SELECT DISTINCT c.* FROM companies c
-       JOIN user_companies uc ON uc.company_id = c.id`
-    )
-    .all<CompanyRow>()
   return results ?? []
 }
 
@@ -196,34 +215,60 @@ export async function upsertCompany(
 }
 
 /**
- * Adds a company to a user's watch list, seeding a notification baseline for
- * whatever is already open. Without this, a user adding a well-established
- * company would be emailed a flood of every posting that's been open for
- * months - the same "baseline on first run" idea from the single-user version,
- * just scoped to (user, company) instead of the whole app's first-ever run.
+ * Queues a "please add this company" ticket rather than attempting live
+ * discovery inline. A user typing an unfamiliar name used to trigger an
+ * immediate probe/Scout/browser-render attempt and trust whatever came back
+ * unverified - which is exactly how Uber ended up wired to the wrong ATS
+ * (a SmartRecruiters slug that resolved to a single dummy posting) until it
+ * was caught and fixed by hand. Now a request just queues; someone verifies
+ * before it's ever added to the global list everyone fetches.
  */
-export async function addUserCompany(db: D1Database, userId: number, companyId: number): Promise<void> {
+export async function requestCompany(
+  db: D1Database,
+  userId: number,
+  name: string,
+  careersUrl?: string | null
+): Promise<number> {
   await db
-    .prepare('INSERT INTO user_companies (user_id, company_id, added_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING')
-    .bind(userId, companyId, now())
-    .run()
-
-  const { results: open } = await db
-    .prepare('SELECT id FROM postings WHERE company_id = ? AND closed_at IS NULL')
-    .bind(companyId)
-    .all<{ id: number }>()
-  if (open && open.length > 0) {
-    const ts = now()
-    const stmt = db.prepare(
-      'INSERT INTO user_posting_notifications (user_id, posting_id, notified_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING'
+    .prepare(
+      `INSERT INTO company_requests (name, careers_url, requested_by, requested_at, status)
+       VALUES (?, ?, ?, ?, 'pending')`
     )
-    await db.batch(open.map((p) => stmt.bind(userId, p.id, ts)))
-  }
+    .bind(name, careersUrl ?? null, userId, now())
+    .run()
+  const row = await db.prepare('SELECT last_insert_rowid() AS id').first<{ id: number }>()
+  return row?.id ?? 0
 }
 
-/** Removes a company from a user's watch list only - the global company/postings are never touched. */
-export async function removeUserCompany(db: D1Database, userId: number, companyId: number): Promise<void> {
-  await db.prepare('DELETE FROM user_companies WHERE user_id = ? AND company_id = ?').bind(userId, companyId).run()
+export interface CompanyRequestRow {
+  id: number
+  name: string
+  careers_url: string | null
+  requested_by: number
+  requested_at: string
+  status: string
+  resolved_company_id: number | null
+  note: string | null
+}
+
+/** Pending tickets, oldest first - the queue whoever resolves requests works through. */
+export async function pendingCompanyRequests(db: D1Database, limit = 50): Promise<CompanyRequestRow[]> {
+  const { results } = await db
+    .prepare(`SELECT * FROM company_requests WHERE status = 'pending' ORDER BY requested_at ASC LIMIT ?`)
+    .bind(limit)
+    .all<CompanyRequestRow>()
+  return results ?? []
+}
+
+export async function resolveCompanyRequest(
+  db: D1Database,
+  id: number,
+  outcome: { status: 'resolved' | 'rejected'; resolvedCompanyId?: number | null; note?: string | null }
+): Promise<void> {
+  await db
+    .prepare('UPDATE company_requests SET status = ?, resolved_company_id = ?, note = ? WHERE id = ?')
+    .bind(outcome.status, outcome.resolvedCompanyId ?? null, outcome.note ?? null, id)
+    .run()
 }
 
 /* ------------------------------------------------------------- postings */
@@ -315,9 +360,13 @@ export async function syncPostings(
     closedCount++
   }
 
-  // D1 batches run atomically, which is the closest equivalent to the desktop
-  // version's transaction.
-  if (statements.length > 0) await db.batch(statements)
+  // Each chunk runs atomically (the closest equivalent to the desktop
+  // version's transaction), though a very large board's sync is no longer
+  // atomic AS A WHOLE across chunks - an acceptable tradeoff since the
+  // alternative is hitting D1's bound-parameter ceiling and failing the
+  // entire sync outright. A crash mid-chunk leaves partial progress, not
+  // corruption: postings are still only ever closed/updated, never deleted.
+  if (statements.length > 0) await batchChunked(db, statements)
 
   const newPostings: SyncResult['newPostings'] = []
   if (inserted.length > 0) {
@@ -381,8 +430,9 @@ export interface PendingNotification {
 }
 
 /**
- * Postings a given user has not yet been notified about, across companies THEY
- * watch. Deliberately does not apply location/degree/function/role-type
+ * Postings a given user has not yet been notified about, across every
+ * company - there is no per-user watch list to scope this to anymore.
+ * Deliberately does not apply location/degree/function/role-type
  * preferences here - that filtering happens at digest time in check.ts (via
  * the shared `applyFilters`), so a user changing their settings can surface an
  * older posting they hadn't been shown before, without re-fetching anything.
@@ -394,14 +444,13 @@ export async function unnotifiedPostingsForUser(db: D1Database, userId: number):
               p.role_type AS roleType, c.name AS companyName
        FROM postings p
        JOIN companies c ON c.id = p.company_id
-       JOIN user_companies uc ON uc.company_id = p.company_id AND uc.user_id = ?
        LEFT JOIN user_posting_notifications n ON n.posting_id = p.id AND n.user_id = ?
        WHERE n.user_id IS NULL AND p.closed_at IS NULL AND p.needs_triage = 0
        ORDER BY CASE p.role_type
                   WHEN 'intern' THEN 0 WHEN 'program' THEN 1
                   WHEN 'newgrad' THEN 2 ELSE 3 END, c.name`
     )
-    .bind(userId, userId)
+    .bind(userId)
     .all<PendingNotification>()
   return results ?? []
 }
@@ -412,16 +461,12 @@ export async function markUserNotified(db: D1Database, userId: number, postingId
   const stmt = db.prepare(
     'INSERT INTO user_posting_notifications (user_id, posting_id, notified_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING'
   )
-  await db.batch(postingIds.map((id) => stmt.bind(userId, id, ts)))
+  await batchChunked(db, postingIds.map((id) => stmt.bind(userId, id, ts)))
 }
 
-/** Every user who watches at least one company - the per-user digest pass iterates this. */
-export async function usersWithWatches(db: D1Database): Promise<UserRow[]> {
-  const { results } = await db
-    .prepare(
-      `SELECT DISTINCT u.* FROM users u JOIN user_companies uc ON uc.user_id = u.id`
-    )
-    .all<UserRow>()
+/** Every signed-up user - the per-user digest pass iterates this, since every user watches every company. */
+export async function listAllUsers(db: D1Database): Promise<UserRow[]> {
+  const { results } = await db.prepare('SELECT * FROM users').all<UserRow>()
   return results ?? []
 }
 
@@ -556,14 +601,10 @@ export async function resolveTriage(
   }
 }
 
-/** Watched companies whose health has gone broken and may need re-discovery. */
+/** Companies whose health has gone broken and may need re-discovery. */
 export async function brokenCompanies(db: D1Database, limit = 10): Promise<CompanyRow[]> {
   const { results } = await db
-    .prepare(
-      `SELECT c.* FROM companies c
-       WHERE c.health = 'broken' AND EXISTS (SELECT 1 FROM user_companies uc WHERE uc.company_id = c.id)
-       ORDER BY c.last_checked_at ASC LIMIT ?`
-    )
+    .prepare(`SELECT * FROM companies WHERE health = 'broken' ORDER BY last_checked_at ASC LIMIT ?`)
     .bind(limit)
     .all<CompanyRow>()
   return results ?? []

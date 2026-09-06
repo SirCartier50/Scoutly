@@ -4,8 +4,8 @@ import type { DegreeLevel, JobFunction } from '../../src/core/classify'
 import { runScout } from '../../src/core/agents/scout'
 import type { AtsType, RoleType } from '../../src/shared/types'
 import {
-  finishRun, distinctWatchedCompanies, markUserNotified, recordCheck, startRun, syncPostings,
-  unnotifiedPostingsForUser, usersWithWatches, getUserSettings, brokenCompanies, setConnector,
+  finishRun, listAllCompanies, listAllUsers, markUserNotified, recordCheck, startRun, syncPostings,
+  unnotifiedPostingsForUser, getUserSettings, brokenCompanies, setConnector,
   recordAgentRun, triageQueue, resolveTriage, closeStalePostings, type Env, type FetchedPosting
 } from './d1'
 import { sendDigest } from './email'
@@ -13,21 +13,25 @@ import { sendDigest } from './email'
 /**
  * One check cycle, in two passes.
  *
- * Pass 1 (global, fetch/classify/store): companies are processed in a bounded
- * slice ordered by least-recently-checked, not all at once - a Worker
- * invocation has a CPU budget, and a user base watching hundreds of companies
- * combined would blow through it. Every early-career-shaped posting is stored
- * regardless of any one user's preferences: role-type/location/function/degree
- * filtering is a per-user lens applied afterward, never baked into what gets
- * fetched or kept. This is the load-bearing decision for multi-tenancy - N
- * users watching the same company still cost ONE fetch, not N.
+ * Pass 1 (global, fetch/classify/store): EVERY approved company is fetched
+ * every run, not a slice - there is no per-user watch list gating which
+ * companies matter, so cost depends only on the total company count, never
+ * on how many users exist. N users still cost ONE fetch per company, not N.
+ * Every early-career-shaped posting is stored regardless of any one user's
+ * preferences: role-type/location/function/degree filtering is a per-user
+ * lens applied afterward, never baked into what gets fetched or kept.
  *
- * Pass 2 (per-user, notify): each user who watches at least one company gets
- * their own unnotified-postings query, filtered through THEIR settings, and
- * their own digest email + notification bookkeeping.
+ * This is why the cron fires a few times a day (see wrangler.toml) rather
+ * than hourly: covering the full company list in one invocation needs
+ * Workers Paid's 1000-subrequest-per-invocation ceiling (Free is 50), and
+ * running that many fetches a few times a day costs less overall than
+ * spreading a smaller slice across 24 hourly runs would.
+ *
+ * Pass 2 (per-user, notify): every signed-up user gets their own
+ * unnotified-postings query, filtered through THEIR settings, and their own
+ * digest email + notification bookkeeping.
  */
-const MAX_PER_RUN = 40
-const CONCURRENCY = 6
+const CONCURRENCY = 12
 
 export interface UserSettings extends Record<string, unknown> {
   locations: string[]
@@ -44,9 +48,9 @@ export interface UserSettings extends Record<string, unknown> {
    * whether the board bothered to take it down. Default matches how long a
    * typical internship posting stays worth applying to. This one setting stays
    * effectively global in practice (it drives a single shared closeStalePostings
-   * pass keyed off the first user's value would be wrong) - so it is read per
-   * user but the run just uses the most permissive (largest) value across all
-   * watching users, meaning no one's postings close earlier than they configured.
+   * pass; keying that off just the first user's value would be wrong) - so it
+   * is read per user but the run uses the most permissive (largest) value
+   * across everyone, meaning no one's postings close earlier than configured.
    */
   maxPostingAgeDays: number
 }
@@ -97,13 +101,14 @@ export interface RunSummary {
  * Bounded to a handful per run so a bad patch of the internet cannot burn the
  * whole model budget in one hour.
  *
- * Deliberately does NOT pass `render` to runScout: this fires on the hourly
- * cron, and real-browser rendering is slow and metered (the free tier is 10
- * browser-minutes/day). Spending that budget on scheduled, automatic repairs
- * would leave nothing for the deliberate case it exists for - a user adding a
- * new hard company by hand. A company Medic can't fix with tiers 0-2 stays
- * broken until someone looks at it, which is the correct failure mode: no
- * cron job should be able to quietly exhaust a shared, capped resource.
+ * Deliberately does NOT pass `render` to runScout: this fires on the
+ * scheduled cron, and real-browser rendering is slow and metered (the free
+ * tier is 10 browser-minutes/day). Spending that budget on scheduled,
+ * automatic repairs would leave nothing for the deliberate case it exists
+ * for - resolving a company request by hand (see requestCompany in d1.ts).
+ * A company Medic can't fix with tiers 0-2 stays broken until someone looks
+ * at it, which is the correct failure mode: no cron job should be able to
+ * quietly exhaust a shared, capped resource.
  */
 async function runMedic(env: Env, limit = 3): Promise<number> {
   if (!env.LLM_API_KEY) return 0
@@ -136,10 +141,9 @@ async function runMedic(env: Env, limit = 3): Promise<number> {
  * one of four labels out - not open-ended discovery.
  *
  * Limit kept modest (each item is its own model-call subrequest) because this
- * shares Cloudflare's 50-subrequest-per-invocation ceiling (Free plan) with
- * the per-company fetch loop, Medic, and the digest emails in the same run -
- * a queue backlog should drain over a few hours, not risk starving the fetch
- * pass that actually matters.
+ * shares one invocation's subrequest budget with the per-company fetch loop,
+ * Medic, and the digest emails - a queue backlog should drain over a few
+ * runs, not risk starving the fetch pass that actually matters.
  */
 async function runTriage(env: Env, limit = 8): Promise<number> {
   if (!env.LLM_API_KEY) return 0
@@ -201,17 +205,13 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
 
   /* --------------------------------------------------- pass 1: fetch/store */
 
-  const all = await distinctWatchedCompanies(db)
-  // Least-recently-checked first, so rotation is fair and nothing starves.
-  const slice = all
-    .sort((a, b) => (a.last_ok_at ?? '').localeCompare(b.last_ok_at ?? ''))
-    .slice(0, MAX_PER_RUN)
+  const all = await listAllCompanies(db)
 
   const runId = await startRun(db, kind)
   let newCount = 0
   let errors = 0
 
-  const queue = [...slice]
+  const queue = [...all]
   const worker = async (): Promise<void> => {
     while (queue.length > 0) {
       const c = queue.shift()
@@ -266,7 +266,7 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
   }
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker))
-  await finishRun(db, runId, { companiesChecked: slice.length, newPostings: newCount, errors })
+  await finishRun(db, runId, { companiesChecked: all.length, newPostings: newCount, errors })
 
   // Medic and Triage run after the main fetch pass so they never compete with
   // it for the Worker's CPU budget, and Triage sees postings from THIS run.
@@ -275,7 +275,7 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
 
   /* --------------------------------------------------- pass 2: per-user notify */
 
-  const users = await usersWithWatches(db)
+  const users = await listAllUsers(db)
   let usersNotified = 0
   let maxAgeDays = DEFAULT_USER_SETTINGS.maxPostingAgeDays
 
@@ -320,5 +320,5 @@ export async function runCheck(env: Env, kind = 'scheduled'): Promise<RunSummary
   const cutoff = new Date(Date.now() - maxAgeDays * 86_400_000).toISOString()
   const staleClosed = await closeStalePostings(db, cutoff)
 
-  return { runId, checked: slice.length, newPostings: newCount, errors, usersNotified, healed, triaged, staleClosed }
+  return { runId, checked: all.length, newPostings: newCount, errors, usersNotified, healed, triaged, staleClosed }
 }

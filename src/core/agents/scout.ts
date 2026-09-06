@@ -75,7 +75,7 @@ interface ScoutAnswer {
 const SYSTEM = `You identify the machine-readable job feed behind a company's careers page.
 
 Reply with ONLY a JSON object of this shape:
-{"found":boolean,"confidence":0..1,"atsType":"greenhouse|lever|ashby|smartrecruiters|workday|careerpage",
+{"found":boolean,"confidence":0..1,"atsType":"greenhouse|lever|ashby|smartrecruiters|workday|oraclehcm|careerpage",
  "boardToken":"string","parseConfig":{"kind":"json-endpoint|html","url":"...","itemsPath":"...",
  "fields":{"externalId":"","title":"","location":"","applyUrl":"","postedAt":"","description":""},
  "selectors":{"item":"","title":"","location":"","link":""},"baseUrl":""},"notes":"string"}
@@ -84,9 +84,15 @@ Prefer, in order:
 1. A public ATS board slug (Greenhouse, Lever, Ashby, SmartRecruiters): set atsType and boardToken.
 2. Workday: atsType "workday", boardToken = the full CXS endpoint,
    e.g. https://TENANT.wd5.myworkdayjobs.com/wday/cxs/TENANT/SITE/jobs
-3. The internal JSON endpoint the page's own JavaScript calls: atsType "careerpage",
+3. Oracle Fusion Cloud Recruiting ("Candidate Experience" - URLs containing
+   /hcmUI/CandidateExperience/ or a *.fa.*.oraclecloud.com host): atsType
+   "oraclehcm", boardToken = "<host>|<siteNumber>|<siteName>" - the siteNumber
+   comes from the page's own recruitingCEJobRequisitions call
+   (finder=findReqs;siteNumber=...), siteName from the /sites/<siteName>/
+   path segment.
+4. The internal JSON endpoint the page's own JavaScript calls: atsType "careerpage",
    parseConfig.kind "json-endpoint", with itemsPath and field paths.
-4. Only as a last resort, CSS selectors over server-rendered HTML.
+5. Only as a last resort, CSS selectors over server-rendered HTML.
 
 A JSON endpoint survives redesigns; CSS selectors break constantly. Never invent an
 endpoint you have not seen evidence for. If unsure, return found=false with low
@@ -280,18 +286,15 @@ async function scoutInner(input: ScoutInput, opts: ScoutOptions): Promise<ScoutR
   }
 
   // Tier 2 - stronger model, only after the cheap tier failed or was rejected.
-  const strongModel = opts.escalationModel ?? null
-  if (!strongModel) {
-    return {
-      ok: false,
-      costUsd: 0,
-      tier: 'cheap',
-      error: cheap.error ?? 'cheap tier could not identify a feed, and no escalation model is configured'
-    }
-  }
+  // Falls back to re-running the cheap model rather than giving up outright
+  // when no distinct escalation model is configured: tier 3 (render) below
+  // still needs SOME model to read its evidence, and reasoning over a real
+  // captured network call is a much easier task than the raw-HTML guessing
+  // tier 1 just failed at, so even the cheap model is worth letting try.
+  const strongModel = opts.escalationModel ?? cheapModel
 
-  const strong = await askModel(opts, strongModel, userContent)
-  if (strong.answer?.found) {
+  const strong = strongModel === cheapModel ? cheap : await askModel(opts, strongModel, userContent)
+  if (opts.escalationModel && strong.answer?.found) {
     const gate = await validate(input, strong.answer)
     if (gate.ok) {
       return {
