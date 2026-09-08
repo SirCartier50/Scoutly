@@ -10,7 +10,7 @@ import {
 // Must match wrangler.toml's `[triggers].crons` first entry - the scheduled
 // handler below uses this to tell the enqueue cron apart from the notify one,
 // since Cloudflare fires the same scheduled() for every cron on this Worker.
-const ENQUEUE_CRON = '0 */6 * * *'
+const ENQUEUE_CRON = '0 */12 * * *'
 
 registerWorkerHtmlParser()
 

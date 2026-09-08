@@ -4,7 +4,7 @@ import type { DegreeLevel, JobFunction } from '../../src/core/classify'
 import { runScout } from '../../src/core/agents/scout'
 import type { AtsType, RoleType } from '../../src/shared/types'
 import {
-  finishRun, listAllCompanies, listAllUsers, markUserNotified, recordCheck, startRun, syncPostings,
+  finishRun, companiesDueForCheck, listAllUsers, markUserNotified, recordCheck, startRun, syncPostings,
   unnotifiedPostingsForUser, getUserSettings, brokenCompanies, setConnector,
   recordAgentRun, triageQueue, resolveTriage, closeStalePostings, type CompanyRow, type Env, type FetchedPosting
 } from './d1'
@@ -15,18 +15,27 @@ import { sendDigest } from './email'
  * deliberately decoupled from each other rather than one big function:
  *
  * Pass 1 (global, fetch/classify/store) - fans out over a queue instead of
- * looping in one invocation. `enqueueFetchJobs` just reads the company list
- * and enqueues one job per company (cheap, no fetching); `fetchAndStoreCompany`
- * is what a queue consumer invocation runs per job, and Cloudflare runs many
- * of those concurrently (up to 250). This is what lets the company count
- * grow past a few hundred without hitting the 50 (Free) / 1000 (Paid)
- * subrequest-per-invocation ceiling: cost still depends only on the total
- * company count, never on user count (N users still cost ONE fetch per
- * company, not N), but now it also doesn't depend on squeezing everything
- * into a single invocation's budget. Every early-career-shaped posting is
- * stored regardless of any one user's preferences - role-type/location/
- * function/degree filtering is a per-user lens applied afterward, never
- * baked into what gets fetched or kept.
+ * looping in one invocation. `enqueueFetchJobs` reads a bounded, due-first
+ * slice of companies (companiesDueForCheck) and enqueues one job per company
+ * (cheap, no fetching); `fetchAndStoreCompany` is what a queue consumer
+ * invocation runs per job, and Cloudflare runs many of those concurrently
+ * (up to 250). This is what lets the company count grow past a few hundred
+ * without hitting the 50 (Free) / 1000 (Paid) subrequest-per-invocation
+ * ceiling - no invocation, producer or consumer, ever has to handle more
+ * than a small slice. Cost still depends only on total company count, never
+ * on user count (N users still cost ONE fetch per company, not N).
+ *
+ * The slice is bounded (not "every company every cycle") for a different
+ * reason than the subrequest ceiling: D1's Free-tier write budget
+ * (100K rows/day). A company's first-ever check inserts every one of its
+ * postings fresh; later checks mostly don't write at all, since syncPostings
+ * skips any posting that hasn't actually changed. The bound keeps the worst
+ * case - a whole cycle made of never-before-seen companies - safely inside
+ * that daily budget; it stops mattering once a company has been checked at
+ * least once. Every early-career-shaped posting is stored regardless of any
+ * one user's preferences - role-type/location/function/degree filtering is
+ * a per-user lens applied afterward, never baked into what gets fetched or
+ * kept.
  *
  * Pass 2 (per-user, notify) - `runNotifyPass` runs on its own later cron,
  * against whatever pass 1 has finished storing by then. No completion
@@ -204,13 +213,24 @@ async function runTriage(env: Env, limit = 8): Promise<number> {
 }
 
 /**
- * Producer: enqueues one fetch job per company. Deliberately does no
+ * Companies due for a check, per cycle - not the whole list at once. Caps
+ * the worst case (every company in this slice being a first-ever check,
+ * each inserting all of its postings fresh) to a D1 write volume that stays
+ * comfortably inside the Free plan's 100K-rows-written/day budget even if
+ * every single cycle in a day hit that worst case simultaneously. Once a
+ * company's been checked at least once, later cycles cost far less (see
+ * syncPostings) regardless of this cap.
+ */
+const MAX_ENQUEUE_PER_CYCLE = 800
+
+/**
+ * Producer: enqueues one fetch job per due company. Deliberately does no
  * fetching itself - this is meant to return fast regardless of how large
  * the company list gets, since the actual work happens in many parallel
  * consumer invocations of `fetchAndStoreCompany` below.
  */
 export async function enqueueFetchJobs(env: Env): Promise<{ queued: number }> {
-  const companies = await listAllCompanies(env.DB)
+  const companies = await companiesDueForCheck(env.DB, MAX_ENQUEUE_PER_CYCLE)
   for (let i = 0; i < companies.length; i += ENQUEUE_BATCH) {
     await env.FETCH_QUEUE.sendBatch(
       companies.slice(i, i + ENQUEUE_BATCH).map((c) => ({ body: { companyId: c.id } }))

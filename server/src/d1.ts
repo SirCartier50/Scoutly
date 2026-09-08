@@ -181,6 +181,27 @@ export async function listAllCompanies(db: D1Database): Promise<CompanyRow[]> {
   return results ?? []
 }
 
+/**
+ * A bounded, least-recently-checked-first slice of companies - what the
+ * enqueue producer actually uses, rather than every company at once. At a
+ * few thousand companies, a company's first-ever check inserts every one of
+ * its postings fresh (unlike later checks, which mostly skip no-op writes -
+ * see syncPostings), so dumping the entire list into one cycle can spend a
+ * free-tier day's whole D1 write budget in one shot. Spreading the initial
+ * backlog across several cycles instead keeps each cycle's worst case
+ * (every company in it being checked for the first time) bounded and safe;
+ * once the backlog is filled, later cycles are far cheaper regardless
+ * because most postings by then are unchanged, not fresh inserts. NULLs
+ * (never checked) sort first, so brand-new companies always win the queue.
+ */
+export async function companiesDueForCheck(db: D1Database, limit: number): Promise<CompanyRow[]> {
+  const { results } = await db
+    .prepare('SELECT * FROM companies ORDER BY last_checked_at IS NOT NULL, last_checked_at ASC LIMIT ?')
+    .bind(limit)
+    .all<CompanyRow>()
+  return results ?? []
+}
+
 export async function upsertCompany(
   db: D1Database,
   c: {
@@ -309,16 +330,31 @@ export async function syncPostings(
   fetched: FetchedPosting[]
 ): Promise<SyncResult> {
   const ts = now()
+  // Full comparable fields, not just external_id: at ~4000 companies,
+  // unconditionally rewriting every already-known posting on every check -
+  // regardless of whether anything changed - was the single biggest D1
+  // write-volume driver, since it happens on every recurring check forever,
+  // not just once. Comparing first and skipping no-op writes turns "N
+  // postings checked" into "N postings read, only the handful that actually
+  // changed written" - reads are 50x cheaper than writes on D1's free tier
+  // (5M/day vs 100K/day) precisely because this pattern is common.
   const { results } = await db
-    .prepare('SELECT external_id FROM postings WHERE company_id = ?')
+    .prepare(
+      `SELECT external_id, title, location, apply_url, description, posted_at, closed_at
+       FROM postings WHERE company_id = ?`
+    )
     .bind(companyId)
-    .all<{ external_id: string }>()
-  const known = new Set((results ?? []).map((r) => r.external_id))
+    .all<{
+      external_id: string; title: string; location: string | null; apply_url: string
+      description: string | null; posted_at: string | null; closed_at: string | null
+    }>()
+  const knownRows = new Map((results ?? []).map((r) => [r.external_id, r]))
   const seen = new Set<string>()
 
   const statements: D1PreparedStatement[] = []
   const inserted: string[] = []
   let updated = 0
+  let unchanged = 0
 
   // posted_at is refreshed here too, not just set at insert: a connector that
   // reported a wrong date (as the Amazon one briefly did - Unix seconds fed in
@@ -340,7 +376,20 @@ export async function syncPostings(
 
   for (const p of fetched) {
     seen.add(p.externalId)
-    if (known.has(p.externalId)) {
+    const existing = knownRows.get(p.externalId)
+    if (existing) {
+      const changed =
+        existing.title !== p.title ||
+        existing.location !== p.location ||
+        existing.apply_url !== p.applyUrl ||
+        existing.closed_at !== null || // was closed, now reappeared - must reopen
+        (p.description !== null && existing.description !== p.description) ||
+        (p.postedAt !== null && existing.posted_at !== p.postedAt)
+
+      if (!changed) {
+        unchanged++
+        continue
+      }
       statements.push(
         updateStmt.bind(ts, p.title, p.location, p.applyUrl, p.description, p.postedAt, companyId, p.externalId)
       )
@@ -360,8 +409,8 @@ export async function syncPostings(
     'UPDATE postings SET closed_at = ? WHERE company_id = ? AND external_id = ? AND closed_at IS NULL'
   )
   let closedCount = 0
-  for (const id of known) {
-    if (seen.has(id)) continue
+  for (const [id, row] of knownRows) {
+    if (seen.has(id) || row.closed_at !== null) continue // already closed - nothing to do
     statements.push(closeStmt.bind(ts, companyId, id))
     closedCount++
   }
