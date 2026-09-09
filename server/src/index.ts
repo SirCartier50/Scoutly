@@ -7,11 +7,6 @@ import {
   type Env, type FetchJob, type UserRow
 } from './d1'
 
-// Must match wrangler.toml's `[triggers].crons` first entry - the scheduled
-// handler below uses this to tell the enqueue cron apart from the notify one,
-// since Cloudflare fires the same scheduled() for every cron on this Worker.
-const ENQUEUE_CRON = '0 */12 * * *'
-
 registerWorkerHtmlParser()
 
 /* --------------------------------------------------------------------- auth */
@@ -259,9 +254,19 @@ export default {
   },
 
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Cloudflare fires this same handler for every cron on the Worker -
-    // event.cron is how it tells the two apart (see wrangler.toml).
-    const isEnqueue = event.cron === ENQUEUE_CRON
+    // Cloudflare fires this same handler for every cron on the Worker.
+    // Previously told apart via event.cron === '<the enqueue cron string>' -
+    // in production that comparison silently never matched (confirmed: the
+    // notify cron fired correctly on schedule per run_log, the enqueue cron
+    // produced zero effect for a full day despite being registered
+    // identically - both crons showed up correctly via the API, so this was
+    // a runtime string-matching failure, not a config problem). Branching on
+    // the scheduled minute instead sidesteps it entirely: the enqueue cron
+    // (wrangler.toml) fires on the hour (:00), the notify cron 30 minutes
+    // later (:30) - event.scheduledTime is a real epoch timestamp Cloudflare
+    // computed from the matched cron, not a string this code has to
+    // reproduce verbatim.
+    const isEnqueue = new Date(event.scheduledTime).getUTCMinutes() < 15
     // waitUntil keeps the invocation alive for the async work after the handler
     // returns, which is how scheduled Workers are meant to do I/O.
     ctx.waitUntil(
