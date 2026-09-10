@@ -4,7 +4,7 @@ import { verifyGoogleIdToken } from './auth'
 import {
   authenticateToken, getUserSettings, issueToken, listAllCompanies,
   requestCompany, setUserPostingStatus, setUserSettings, upsertUser,
-  type Env, type FetchJob, type UserRow
+  withDb, type Env, type FetchJob, type RawEnv, type UserRow
 } from './d1'
 
 registerWorkerHtmlParser()
@@ -234,11 +234,19 @@ async function handleApi(req: Request, env: Env, url: URL, user: UserRow): Promi
 
 /* ------------------------------------------------------------------ worker */
 
+// Each entry point connects the database once and passes the result down -
+// Turso is reached over HTTP, so unlike a D1 binding there is nothing on the
+// raw env to use directly (see withDb in d1.ts).
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, rawEnv: RawEnv): Promise<Response> {
     const url = new URL(req.url)
 
+    // Answered before touching the database, so /health stays a true liveness
+    // check rather than an implicit database check.
     if (url.pathname === '/health') return json({ ok: true })
+
+    const env = withDb(rawEnv)
+
     if (url.pathname === '/api/auth/google' && req.method === 'POST') return await handleGoogleAuth(req, env)
 
     if (!url.pathname.startsWith('/api/')) return json({ error: 'not found' }, 404)
@@ -253,7 +261,8 @@ export default {
     }
   },
 
-  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(event: ScheduledController, rawEnv: RawEnv, ctx: ExecutionContext): Promise<void> {
+    const env = withDb(rawEnv)
     // Cloudflare fires this same handler for every cron on the Worker.
     // Previously told apart via event.cron === '<the enqueue cron string>' -
     // in production that comparison silently never matched (confirmed: the
@@ -282,7 +291,8 @@ export default {
    * different batches at once - see check.ts's doc comment on why this is
    * what actually lets the company count scale past a few hundred.
    */
-  async queue(batch: MessageBatch<FetchJob>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<FetchJob>, rawEnv: RawEnv): Promise<void> {
+    const env = withDb(rawEnv)
     for (const msg of batch.messages) {
       try {
         await fetchAndStoreCompany(env, msg.body.companyId)

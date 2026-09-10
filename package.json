@@ -28,6 +28,7 @@
     "check:scout": "node scripts/run-check.mjs scripts/scout-check.ts"
   },
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "cheerio": "^1.1.2",
     "jose": "^5.10.0",
     "zod": "^3.25.76"

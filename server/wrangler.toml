@@ -4,11 +4,14 @@ compatibility_date = "2026-08-01"
 # nodejs_compat gives us URL, TextDecoder and friends that the shared core uses.
 compatibility_flags = ["nodejs_compat"]
 
-[[d1_databases]]
-binding = "DB"
-database_name = "career-watch"
-# Filled in by: wrangler d1 create career-watch
-database_id = "41baea19-f7ec-4180-8246-4a485ed57390"
+# No database binding: storage moved off D1 to Turso (libSQL), which is
+# reached over HTTP with a URL + token rather than bound by the runtime - see
+# server/src/db.ts for the adapter and the reasoning. D1's Free plan capped
+# writes at 100K rows/day and rejected EVERY query account-wide once hit
+# (which took sign-in down with it); Turso's free plan allows 10M rows
+# written per month. Still SQLite underneath, so no SQL changed.
+#
+# TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are set as secrets (below).
 
 # Real Chromium, used ONLY for one-off discovery of hard custom career sites
 # (e.g. Google's SPA has zero job data in its raw HTML - it only exists after
@@ -58,6 +61,8 @@ crons = ["0 */12 * * *", "30 */12 * * *"]
 enabled = true
 
 # Secrets are set with `wrangler secret put NAME`, never committed:
+#   TURSO_DATABASE_URL - libsql://<db>-<org>.turso.io  (from `turso db show`)
+#   TURSO_AUTH_TOKEN   - from `turso db tokens create <db>`
 #   RESEND_API_KEY   - transactional email (see server/src/email.ts's note on
 #                      the onboarding@resend.dev sandbox limitation - it can
 #                      only deliver to the Resend account's own verified

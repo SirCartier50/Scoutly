@@ -26,7 +26,7 @@ import { sendDigest } from './email'
  * on user count (N users still cost ONE fetch per company, not N).
  *
  * The slice is bounded (not "every company every cycle") for a different
- * reason than the subrequest ceiling: D1's Free-tier write budget
+ * reason than the subrequest ceiling: the free-tier write budget
  * (100K rows/day). A company's first-ever check inserts every one of its
  * postings fresh; later checks mostly don't write at all, since syncPostings
  * skips any posting that hasn't actually changed. The bound keeps the worst
@@ -215,7 +215,7 @@ async function runTriage(env: Env, limit = 8): Promise<number> {
 /**
  * Companies due for a check, per cycle - not the whole list at once. Caps
  * the worst case (every company in this slice being a first-ever check,
- * each inserting all of its postings fresh) to a D1 write volume that stays
+ * each inserting all of its postings fresh) to a write volume that stays
  * comfortably inside the Free plan's 100K-rows-written/day budget even if
  * every single cycle in a day hit that worst case simultaneously. Once a
  * company's been checked at least once, later cycles cost far less (see
