@@ -1,9 +1,14 @@
 import type { RoleType } from '../../src/shared/types'
 import type { BrowserWorker } from '@cloudflare/puppeteer'
+import { createDb, type BoundStatement, type Db } from './db'
 
 /**
- * D1 repository. Mirrors the desktop repo layer's semantics exactly - the
- * difference is that every call is async, because D1 has no synchronous API.
+ * The repository layer. Every call is async because the storage engine has no
+ * synchronous API (true of D1 before, and of Turso now).
+ *
+ * Runs on Turso (libSQL) rather than D1 - see db.ts for why, and for the
+ * adapter that lets this file keep D1's `prepare().bind().all()` shape
+ * unchanged. It is still SQLite underneath, so none of the SQL here moved.
  *
  * The safety property carried over from the desktop version: a posting is never
  * deleted, only marked closed, and closing only ever happens on the result of a
@@ -11,11 +16,10 @@ import type { BrowserWorker } from '@cloudflare/puppeteer'
  *
  * Multi-tenant shape (see migrations/0006_multi_tenant.sql): companies and
  * postings stay GLOBAL - fetched once per company regardless of how many users
- * watch it, which is what keeps this inside Cloudflare's 50-subrequest-per-
- * invocation ceiling as the user base grows. Everything user-specific (watch
- * list, filter settings, notification state, application status) lives in
- * join tables and is applied at read/notify time, never baked into fetch or
- * storage.
+ * watch it, which is what keeps this inside Cloudflare's subrequest ceiling as
+ * the user base grows. Everything user-specific (watch list, filter settings,
+ * notification state, application status) lives in join tables and is applied
+ * at read/notify time, never baked into fetch or storage.
  */
 
 /** One job per company - the producer enqueues these, the consumer fetches just this one. */
@@ -23,10 +27,11 @@ export interface FetchJob {
   companyId: number
 }
 
-export interface Env {
-  DB: D1Database
+/** What Cloudflare actually hands the Worker: secrets and bindings, no database. */
+export interface RawEnv {
+  TURSO_DATABASE_URL: string
+  TURSO_AUTH_TOKEN: string
   RESEND_API_KEY?: string
-  CLIENT_TOKEN?: string
   LLM_API_KEY?: string
   LLM_BASE_URL?: string
   LLM_MODEL?: string
@@ -36,17 +41,32 @@ export interface Env {
   FETCH_QUEUE: Queue<FetchJob>
 }
 
+/** RawEnv plus the connected database - what everything downstream expects. */
+export interface Env extends RawEnv {
+  DB: Db
+}
+
+/**
+ * Turso is reached over HTTP rather than bound by the runtime, so unlike a D1
+ * binding the connection has to be built per invocation. Every entry point
+ * (fetch/scheduled/queue) calls this once and passes the result down, which is
+ * why nothing below here had to change when the engine swapped.
+ */
+export function withDb(env: RawEnv): Env {
+  return { ...env, DB: createDb(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN) }
+}
+
 const now = (): string => new Date().toISOString()
 
 /**
- * D1.batch() shares SQLite's bound-parameter ceiling (999) across the WHOLE
+ * batch() shares SQLite's bound-parameter ceiling across the WHOLE
  * batch, not per statement - a single call built from an unbounded row count
  * (every posting on a big board, a user's entire first-ever unnotified
  * backlog) can blow past it silently until it doesn't. Chunked defensively
  * wherever the statement count scales with live data rather than a small
  * fixed set (e.g. settings keys, which stay tiny and skip this).
  */
-async function batchChunked(db: D1Database, statements: D1PreparedStatement[], chunkSize = 80): Promise<void> {
+async function batchChunked(db: Db, statements: BoundStatement[], chunkSize = 80): Promise<void> {
   for (let i = 0; i < statements.length; i += chunkSize) {
     await db.batch(statements.slice(i, i + chunkSize))
   }
@@ -80,7 +100,7 @@ export interface UserRow {
  * version, just scoped to (this new user) instead of (the whole app).
  */
 export async function upsertUser(
-  db: D1Database,
+  db: Db,
   u: { googleSub: string; email: string; name?: string | null; pictureUrl?: string | null }
 ): Promise<UserRow> {
   const existing = await db.prepare('SELECT * FROM users WHERE google_sub = ?').bind(u.googleSub).first<UserRow>()
@@ -122,7 +142,7 @@ async function sha256Hex(input: string): Promise<string> {
 }
 
 /** Issues a new per-user bearer token, storing only its hash (never the raw value). */
-export async function issueToken(db: D1Database, userId: number): Promise<string> {
+export async function issueToken(db: Db, userId: number): Promise<string> {
   const raw = [...crypto.getRandomValues(new Uint8Array(32))].map((b) => b.toString(16).padStart(2, '0')).join('')
   const hash = await sha256Hex(raw)
   await db
@@ -133,7 +153,7 @@ export async function issueToken(db: D1Database, userId: number): Promise<string
 }
 
 /** Resolves a raw bearer token to its owning user, updating last-used bookkeeping. */
-export async function authenticateToken(db: D1Database, rawToken: string): Promise<UserRow | null> {
+export async function authenticateToken(db: Db, rawToken: string): Promise<UserRow | null> {
   if (!rawToken) return null
   const hash = await sha256Hex(rawToken)
   const row = await db
@@ -176,13 +196,34 @@ export interface CompanyRow {
  * entirely in user_settings (Postings-tab filtering) and user_posting_status
  * (application tracking), never in which companies exist for a given user.
  */
-export async function listAllCompanies(db: D1Database): Promise<CompanyRow[]> {
+export async function listAllCompanies(db: Db): Promise<CompanyRow[]> {
   const { results } = await db.prepare('SELECT * FROM companies ORDER BY name').all<CompanyRow>()
   return results ?? []
 }
 
+/**
+ * A bounded, least-recently-checked-first slice of companies - what the
+ * enqueue producer actually uses, rather than every company at once. At a
+ * few thousand companies, a company's first-ever check inserts every one of
+ * its postings fresh (unlike later checks, which mostly skip no-op writes -
+ * see syncPostings), so dumping the entire list into one cycle can spend a
+ * free-tier day's whole write budget in one shot. Spreading the initial
+ * backlog across several cycles instead keeps each cycle's worst case
+ * (every company in it being checked for the first time) bounded and safe;
+ * once the backlog is filled, later cycles are far cheaper regardless
+ * because most postings by then are unchanged, not fresh inserts. NULLs
+ * (never checked) sort first, so brand-new companies always win the queue.
+ */
+export async function companiesDueForCheck(db: Db, limit: number): Promise<CompanyRow[]> {
+  const { results } = await db
+    .prepare('SELECT * FROM companies ORDER BY last_checked_at IS NOT NULL, last_checked_at ASC LIMIT ?')
+    .bind(limit)
+    .all<CompanyRow>()
+  return results ?? []
+}
+
 export async function upsertCompany(
-  db: D1Database,
+  db: Db,
   c: {
     name: string
     careersUrl: string
@@ -230,7 +271,7 @@ export async function upsertCompany(
  * before it's ever added to the global list everyone fetches.
  */
 export async function requestCompany(
-  db: D1Database,
+  db: Db,
   userId: number,
   name: string,
   careersUrl?: string | null
@@ -258,7 +299,7 @@ export interface CompanyRequestRow {
 }
 
 /** Pending tickets, oldest first - the queue whoever resolves requests works through. */
-export async function pendingCompanyRequests(db: D1Database, limit = 50): Promise<CompanyRequestRow[]> {
+export async function pendingCompanyRequests(db: Db, limit = 50): Promise<CompanyRequestRow[]> {
   const { results } = await db
     .prepare(`SELECT * FROM company_requests WHERE status = 'pending' ORDER BY requested_at ASC LIMIT ?`)
     .bind(limit)
@@ -267,7 +308,7 @@ export async function pendingCompanyRequests(db: D1Database, limit = 50): Promis
 }
 
 export async function resolveCompanyRequest(
-  db: D1Database,
+  db: Db,
   id: number,
   outcome: { status: 'resolved' | 'rejected'; resolvedCompanyId?: number | null; note?: string | null }
 ): Promise<void> {
@@ -304,21 +345,36 @@ export interface SyncResult {
  * false all-clear.
  */
 export async function syncPostings(
-  db: D1Database,
+  db: Db,
   companyId: number,
   fetched: FetchedPosting[]
 ): Promise<SyncResult> {
   const ts = now()
+  // Full comparable fields, not just external_id: at ~4000 companies,
+  // unconditionally rewriting every already-known posting on every check -
+  // regardless of whether anything changed - was the single biggest
+  // write-volume driver, since it happens on every recurring check forever,
+  // not just once. Comparing first and skipping no-op writes turns "N
+  // postings checked" into "N postings read, only the handful that actually
+  // changed written" - reads are far cheaper than writes on the free tier
+  // (5M/day vs 100K/day) precisely because this pattern is common.
   const { results } = await db
-    .prepare('SELECT external_id FROM postings WHERE company_id = ?')
+    .prepare(
+      `SELECT external_id, title, location, apply_url, description, posted_at, closed_at
+       FROM postings WHERE company_id = ?`
+    )
     .bind(companyId)
-    .all<{ external_id: string }>()
-  const known = new Set((results ?? []).map((r) => r.external_id))
+    .all<{
+      external_id: string; title: string; location: string | null; apply_url: string
+      description: string | null; posted_at: string | null; closed_at: string | null
+    }>()
+  const knownRows = new Map((results ?? []).map((r) => [r.external_id, r]))
   const seen = new Set<string>()
 
-  const statements: D1PreparedStatement[] = []
+  const statements: BoundStatement[] = []
   const inserted: string[] = []
   let updated = 0
+  let unchanged = 0
 
   // posted_at is refreshed here too, not just set at insert: a connector that
   // reported a wrong date (as the Amazon one briefly did - Unix seconds fed in
@@ -340,7 +396,20 @@ export async function syncPostings(
 
   for (const p of fetched) {
     seen.add(p.externalId)
-    if (known.has(p.externalId)) {
+    const existing = knownRows.get(p.externalId)
+    if (existing) {
+      const changed =
+        existing.title !== p.title ||
+        existing.location !== p.location ||
+        existing.apply_url !== p.applyUrl ||
+        existing.closed_at !== null || // was closed, now reappeared - must reopen
+        (p.description !== null && existing.description !== p.description) ||
+        (p.postedAt !== null && existing.posted_at !== p.postedAt)
+
+      if (!changed) {
+        unchanged++
+        continue
+      }
       statements.push(
         updateStmt.bind(ts, p.title, p.location, p.applyUrl, p.description, p.postedAt, companyId, p.externalId)
       )
@@ -360,8 +429,8 @@ export async function syncPostings(
     'UPDATE postings SET closed_at = ? WHERE company_id = ? AND external_id = ? AND closed_at IS NULL'
   )
   let closedCount = 0
-  for (const id of known) {
-    if (seen.has(id)) continue
+  for (const [id, row] of knownRows) {
+    if (seen.has(id) || row.closed_at !== null) continue // already closed - nothing to do
     statements.push(closeStmt.bind(ts, companyId, id))
     closedCount++
   }
@@ -369,7 +438,7 @@ export async function syncPostings(
   // Each chunk runs atomically (the closest equivalent to the desktop
   // version's transaction), though a very large board's sync is no longer
   // atomic AS A WHOLE across chunks - an acceptable tradeoff since the
-  // alternative is hitting D1's bound-parameter ceiling and failing the
+  // alternative is hitting SQLite's bound-parameter ceiling and failing the
   // entire sync outright. A crash mid-chunk leaves partial progress, not
   // corruption: postings are still only ever closed/updated, never deleted.
   if (statements.length > 0) await batchChunked(db, statements)
@@ -391,7 +460,7 @@ export async function syncPostings(
 }
 
 export async function recordCheck(
-  db: D1Database,
+  db: Db,
   id: number,
   outcome: { ok: boolean; yield?: number; error?: string; health?: string }
 ): Promise<void> {
@@ -443,7 +512,7 @@ export interface PendingNotification {
  * the shared `applyFilters`), so a user changing their settings can surface an
  * older posting they hadn't been shown before, without re-fetching anything.
  */
-export async function unnotifiedPostingsForUser(db: D1Database, userId: number): Promise<PendingNotification[]> {
+export async function unnotifiedPostingsForUser(db: Db, userId: number): Promise<PendingNotification[]> {
   const { results } = await db
     .prepare(
       `SELECT p.id, p.title, p.location, p.description, p.apply_url AS applyUrl, p.posted_at AS postedAt,
@@ -461,7 +530,7 @@ export async function unnotifiedPostingsForUser(db: D1Database, userId: number):
   return results ?? []
 }
 
-export async function markUserNotified(db: D1Database, userId: number, postingIds: number[]): Promise<void> {
+export async function markUserNotified(db: Db, userId: number, postingIds: number[]): Promise<void> {
   if (postingIds.length === 0) return
   const ts = now()
   const stmt = db.prepare(
@@ -471,7 +540,7 @@ export async function markUserNotified(db: D1Database, userId: number, postingId
 }
 
 /** Every signed-up user - the per-user digest pass iterates this, since every user watches every company. */
-export async function listAllUsers(db: D1Database): Promise<UserRow[]> {
+export async function listAllUsers(db: Db): Promise<UserRow[]> {
   const { results } = await db.prepare('SELECT * FROM users').all<UserRow>()
   return results ?? []
 }
@@ -484,7 +553,7 @@ export async function listAllUsers(db: D1Database): Promise<UserRow[]> {
  * already shows). Closed, never deleted - identical to how a posting
  * disappearing from a feed is handled, so history and stats stay intact.
  */
-export async function closeStalePostings(db: D1Database, cutoffIso: string): Promise<number> {
+export async function closeStalePostings(db: Db, cutoffIso: string): Promise<number> {
   const res = await db
     .prepare(
       `UPDATE postings SET closed_at = ?
@@ -498,7 +567,7 @@ export async function closeStalePostings(db: D1Database, cutoffIso: string): Pro
 /* --------------------------------------------------------- per-user status */
 
 export async function setUserPostingStatus(
-  db: D1Database,
+  db: Db,
   userId: number,
   postingId: number,
   status: string,
@@ -520,7 +589,7 @@ export async function setUserPostingStatus(
 /* -------------------------------------------------------- per-user settings */
 
 export async function getUserSettings<T extends Record<string, unknown>>(
-  db: D1Database,
+  db: Db,
   userId: number,
   defaults: T
 ): Promise<T> {
@@ -540,7 +609,7 @@ export async function getUserSettings<T extends Record<string, unknown>>(
   return out
 }
 
-export async function setUserSettings(db: D1Database, userId: number, patch: Record<string, unknown>): Promise<void> {
+export async function setUserSettings(db: Db, userId: number, patch: Record<string, unknown>): Promise<void> {
   const entries = Object.entries(patch)
   if (entries.length === 0) return
   const stmt = db.prepare(
@@ -552,14 +621,14 @@ export async function setUserSettings(db: D1Database, userId: number, patch: Rec
 
 /* ------------------------------------------------------------- run log */
 
-export async function startRun(db: D1Database, kind: string): Promise<number> {
+export async function startRun(db: Db, kind: string): Promise<number> {
   await db.prepare('INSERT INTO run_log (kind, started_at) VALUES (?, ?)').bind(kind, now()).run()
   const r = await db.prepare('SELECT last_insert_rowid() AS id').first<{ id: number }>()
   return r?.id ?? 0
 }
 
 export async function finishRun(
-  db: D1Database,
+  db: Db,
   runId: number,
   s: { companiesChecked: number; newPostings: number; errors: number }
 ): Promise<void> {
@@ -581,7 +650,7 @@ export interface TriageCandidate {
 }
 
 /** Postings flagged ambiguous by the classifier, oldest first, capped per run. */
-export async function triageQueue(db: D1Database, limit = 20): Promise<TriageCandidate[]> {
+export async function triageQueue(db: Db, limit = 20): Promise<TriageCandidate[]> {
   const { results } = await db
     .prepare(
       `SELECT id, title, description, company_id AS companyId FROM postings
@@ -594,7 +663,7 @@ export async function triageQueue(db: D1Database, limit = 20): Promise<TriageCan
 }
 
 export async function resolveTriage(
-  db: D1Database,
+  db: Db,
   id: number,
   roleType: RoleType | null
 ): Promise<void> {
@@ -608,7 +677,7 @@ export async function resolveTriage(
 }
 
 /** Companies whose health has gone broken and may need re-discovery. */
-export async function brokenCompanies(db: D1Database, limit = 10): Promise<CompanyRow[]> {
+export async function brokenCompanies(db: Db, limit = 10): Promise<CompanyRow[]> {
   const { results } = await db
     .prepare(`SELECT * FROM companies WHERE health = 'broken' ORDER BY last_checked_at ASC LIMIT ?`)
     .bind(limit)
@@ -617,7 +686,7 @@ export async function brokenCompanies(db: D1Database, limit = 10): Promise<Compa
 }
 
 export async function setConnector(
-  db: D1Database,
+  db: Db,
   id: number,
   atsType: string,
   boardToken: string | null,
@@ -630,7 +699,7 @@ export async function setConnector(
 }
 
 export async function recordAgentRun(
-  db: D1Database,
+  db: Db,
   r: { role: string; model: string; companyId?: number | null; usd: number; ok: boolean; error?: string | null }
 ): Promise<void> {
   await db

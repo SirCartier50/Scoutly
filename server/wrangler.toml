@@ -4,11 +4,14 @@ compatibility_date = "2026-08-01"
 # nodejs_compat gives us URL, TextDecoder and friends that the shared core uses.
 compatibility_flags = ["nodejs_compat"]
 
-[[d1_databases]]
-binding = "DB"
-database_name = "career-watch"
-# Filled in by: wrangler d1 create career-watch
-database_id = "41baea19-f7ec-4180-8246-4a485ed57390"
+# No database binding: storage moved off D1 to Turso (libSQL), which is
+# reached over HTTP with a URL + token rather than bound by the runtime - see
+# server/src/db.ts for the adapter and the reasoning. D1's Free plan capped
+# writes at 100K rows/day and rejected EVERY query account-wide once hit
+# (which took sign-in down with it); Turso's free plan allows 10M rows
+# written per month. Still SQLite underneath, so no SQL changed.
+#
+# TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are set as secrets (below).
 
 # Real Chromium, used ONLY for one-off discovery of hard custom career sites
 # (e.g. Google's SPA has zero job data in its raw HTML - it only exists after
@@ -42,14 +45,24 @@ max_concurrency = 25
 # handful of the slowest companies landing just after the notify pass ran
 # simply get picked up on the NEXT pass, which is a fine trade for not
 # building a distributed "is everyone done yet?" check for a job digest.
+#
+# Twice a day (not more) is a deliberate cost choice, not just a nod to the
+# original design intent: each enqueue cycle is capped to a bounded slice
+# (see check.ts's MAX_ENQUEUE_PER_CYCLE) sized so its worst case - every
+# company in it being a never-before-seen company, each inserting every
+# posting fresh - stays safely inside the Free plan's 100K-D1-writes/day
+# ceiling. Running this more often multiplies that worst case per day for
+# no real benefit: job postings don't need sub-daily freshness.
 # Update ENQUEUE_CRON in index.ts if this first entry ever moves.
 [triggers]
-crons = ["0 */6 * * *", "30 */6 * * *"]
+crons = ["0 */12 * * *", "30 */12 * * *"]
 
 [observability]
 enabled = true
 
 # Secrets are set with `wrangler secret put NAME`, never committed:
+#   TURSO_DATABASE_URL - libsql://<db>-<org>.turso.io  (from `turso db show`)
+#   TURSO_AUTH_TOKEN   - from `turso db tokens create <db>`
 #   RESEND_API_KEY   - transactional email (see server/src/email.ts's note on
 #                      the onboarding@resend.dev sandbox limitation - it can
 #                      only deliver to the Resend account's own verified

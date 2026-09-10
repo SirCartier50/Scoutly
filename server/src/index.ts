@@ -4,13 +4,8 @@ import { verifyGoogleIdToken } from './auth'
 import {
   authenticateToken, getUserSettings, issueToken, listAllCompanies,
   requestCompany, setUserPostingStatus, setUserSettings, upsertUser,
-  type Env, type FetchJob, type UserRow
+  withDb, type Env, type FetchJob, type RawEnv, type UserRow
 } from './d1'
-
-// Must match wrangler.toml's `[triggers].crons` first entry - the scheduled
-// handler below uses this to tell the enqueue cron apart from the notify one,
-// since Cloudflare fires the same scheduled() for every cron on this Worker.
-const ENQUEUE_CRON = '0 */6 * * *'
 
 registerWorkerHtmlParser()
 
@@ -239,11 +234,19 @@ async function handleApi(req: Request, env: Env, url: URL, user: UserRow): Promi
 
 /* ------------------------------------------------------------------ worker */
 
+// Each entry point connects the database once and passes the result down -
+// Turso is reached over HTTP, so unlike a D1 binding there is nothing on the
+// raw env to use directly (see withDb in d1.ts).
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, rawEnv: RawEnv): Promise<Response> {
     const url = new URL(req.url)
 
+    // Answered before touching the database, so /health stays a true liveness
+    // check rather than an implicit database check.
     if (url.pathname === '/health') return json({ ok: true })
+
+    const env = withDb(rawEnv)
+
     if (url.pathname === '/api/auth/google' && req.method === 'POST') return await handleGoogleAuth(req, env)
 
     if (!url.pathname.startsWith('/api/')) return json({ error: 'not found' }, 404)
@@ -258,10 +261,21 @@ export default {
     }
   },
 
-  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    // Cloudflare fires this same handler for every cron on the Worker -
-    // event.cron is how it tells the two apart (see wrangler.toml).
-    const isEnqueue = event.cron === ENQUEUE_CRON
+  async scheduled(event: ScheduledController, rawEnv: RawEnv, ctx: ExecutionContext): Promise<void> {
+    const env = withDb(rawEnv)
+    // Cloudflare fires this same handler for every cron on the Worker.
+    // Previously told apart via event.cron === '<the enqueue cron string>' -
+    // in production that comparison silently never matched (confirmed: the
+    // notify cron fired correctly on schedule per run_log, the enqueue cron
+    // produced zero effect for a full day despite being registered
+    // identically - both crons showed up correctly via the API, so this was
+    // a runtime string-matching failure, not a config problem). Branching on
+    // the scheduled minute instead sidesteps it entirely: the enqueue cron
+    // (wrangler.toml) fires on the hour (:00), the notify cron 30 minutes
+    // later (:30) - event.scheduledTime is a real epoch timestamp Cloudflare
+    // computed from the matched cron, not a string this code has to
+    // reproduce verbatim.
+    const isEnqueue = new Date(event.scheduledTime).getUTCMinutes() < 15
     // waitUntil keeps the invocation alive for the async work after the handler
     // returns, which is how scheduled Workers are meant to do I/O.
     ctx.waitUntil(
@@ -277,7 +291,8 @@ export default {
    * different batches at once - see check.ts's doc comment on why this is
    * what actually lets the company count scale past a few hundred.
    */
-  async queue(batch: MessageBatch<FetchJob>, env: Env): Promise<void> {
+  async queue(batch: MessageBatch<FetchJob>, rawEnv: RawEnv): Promise<void> {
+    const env = withDb(rawEnv)
     for (const msg of batch.messages) {
       try {
         await fetchAndStoreCompany(env, msg.body.companyId)
