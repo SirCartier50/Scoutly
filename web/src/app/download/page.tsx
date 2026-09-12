@@ -40,7 +40,13 @@ export default async function DownloadPage() {
         Download for Windows (.exe)
       </a>
 
-      {session?.user && <TokenBox />}
+      {session?.cwError && (
+        <p className="w-full max-w-md rounded-md border border-red-900 bg-red-950 px-4 py-3 text-sm text-red-200">
+          Signed in, but couldn&apos;t link this session to Career Watch: {session.cwError}.
+          Sign out and back in to retry.
+        </p>
+      )}
+      {session?.user && !session.cwError && <TokenBox />}
 
       <p className="text-xs text-neutral-500">
         Windows only for now.{' '}
