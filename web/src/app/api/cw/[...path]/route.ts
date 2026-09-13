@@ -10,7 +10,16 @@ import { NextRequest, NextResponse } from 'next/server'
 const WORKER_URL = process.env.CAREER_WATCH_WORKER_URL ?? 'http://127.0.0.1:8787'
 
 async function proxy(req: NextRequest, path: string[]): Promise<NextResponse> {
-  const token = await getToken({ req, secret: process.env.AUTH_SECRET })
+  // getToken() defaults secureCookie to false, so left unset it looks for the
+  // plain `authjs.session-token` cookie - wrong in production, where Auth.js
+  // sets `__Secure-authjs.session-token` over https. That silently 401'd
+  // every request on Vercel while working fine over local http, which is
+  // exactly what hid it.
+  const token = await getToken({
+    req,
+    secret: process.env.AUTH_SECRET,
+    secureCookie: req.nextUrl.protocol === 'https:'
+  })
   if (!token?.cwToken) {
     return NextResponse.json({ error: token?.cwError ?? 'not signed in' }, { status: 401 })
   }
