@@ -10,7 +10,13 @@ import { NextRequest, NextResponse } from 'next/server'
  * the one person who's allowed to see it, on demand, rather than never.
  */
 export async function GET(req: NextRequest) {
-  const token = await getToken({ req, secret: process.env.AUTH_SECRET })
+  // See api/cw/[...path]/route.ts's comment: secureCookie must be set
+  // explicitly or getToken() looks for the wrong cookie name in production.
+  const token = await getToken({
+    req,
+    secret: process.env.AUTH_SECRET,
+    secureCookie: req.nextUrl.protocol === 'https:'
+  })
   if (!token?.cwToken) {
     return NextResponse.json({ error: token?.cwError ?? 'not signed in' }, { status: 401 })
   }
