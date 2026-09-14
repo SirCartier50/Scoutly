@@ -60,6 +60,17 @@ const ROLE_LABEL: Record<RoleType, string> = {
 }
 const STATUS_OPTIONS: AppStatus[] = ['none', 'interested', 'applied', 'interviewing', 'rejected', 'offer']
 
+// Ids match src/core/classify.ts's JobFunction. `engineering` is software
+// engineering specifically - non-software disciplines are `hardware`.
+const FUNCTION_OPTIONS: [string, string][] = [
+  ['engineering', 'Software engineering'],
+  ['data', 'Data / ML'],
+  ['hardware', 'Hardware & other engineering'],
+  ['product', 'Product'],
+  ['design', 'Design'],
+  ['business', 'Business & ops']
+]
+
 async function cw<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api/cw${path}`, {
     ...init,
@@ -387,6 +398,35 @@ export default function Dashboard() {
                 <option value="phd">PhD</option>
               </select>
             </label>
+            <div className="flex flex-col gap-2 text-sm sm:col-span-2">
+              Job functions (applies to Postings below and the digest email)
+              <div className="flex flex-wrap gap-2">
+                {FUNCTION_OPTIONS.map(([id, label]) => {
+                  const active = settings.functions.includes(id)
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() =>
+                        setSettings({
+                          ...settings,
+                          functions: active ? settings.functions.filter((f) => f !== id) : [...settings.functions, id]
+                        })
+                      }
+                      className={`rounded-full border px-3 py-1 text-xs ${
+                        active ? 'border-white bg-white text-neutral-900' : 'border-neutral-700 text-neutral-300'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  )
+                })}
+              </div>
+              <span className="text-xs text-neutral-500">
+                None selected = every function. A title with no function keywords is judged by its description.
+                Fellowships are never filtered.
+              </span>
+            </div>
             <div className="flex flex-wrap items-center gap-4 sm:col-span-2">
               {([
                 ['wantIntern', 'Internships'],

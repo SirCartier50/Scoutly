@@ -1,6 +1,8 @@
 import { registerWorkerHtmlParser } from './htmlParser'
 import { enqueueFetchJobs, fetchAndStoreCompany, runNotifyPass, DEFAULT_USER_SETTINGS } from './check'
 import { verifyGoogleIdToken } from './auth'
+import { functionAllowed } from '../../src/core/classify'
+import type { RoleType } from '../../src/shared/types'
 import {
   authenticateToken, getUserSettings, issueToken, listAllCompanies,
   requestCompany, setUserPostingStatus, setUserSettings, upsertUser,
@@ -103,6 +105,7 @@ async function handleApi(req: Request, env: Env, url: URL, user: UserRow): Promi
     const search = url.searchParams.get('search')?.trim() ?? ''
     const maybe = url.searchParams.get('maybe') === '1'
     const companyId = url.searchParams.get('companyId')
+    const allFunctions = url.searchParams.get('allFunctions') === '1'
 
     const where = ['p.closed_at IS NULL', `p.needs_triage = ${maybe ? 1 : 0}`]
     const args: unknown[] = []
@@ -164,11 +167,22 @@ async function handleApi(req: Request, env: Env, url: URL, user: UserRow): Promi
          LEFT JOIN user_posting_status s ON s.posting_id = p.id AND s.user_id = ?
          WHERE ${where.join(' AND ')}
          ORDER BY ${orderBy}
-         LIMIT 500`
+         LIMIT 3000`
       )
       .bind(...selectArgs, userId, ...args, ...whereArgs)
-      .all()
-    return json(results ?? [])
+      .all<{ title: string; roleType: RoleType; description: string | null }>()
+
+    // Function filtering is regex over title + description, which SQL can't
+    // express - so it runs here, against the user's SAVED functions, the same
+    // rule the digest email applies. Without this the dashboard showed every
+    // function while the email showed a filtered subset, and neither matched
+    // what the settings said. Over-fetching above leaves room for the filter
+    // to discard most rows and still fill a page.
+    const settings = await getUserSettings(db, userId, DEFAULT_USER_SETTINGS)
+    const filtered = allFunctions
+      ? (results ?? [])
+      : (results ?? []).filter((p) => functionAllowed(p.title, p.roleType, settings.functions, p.description))
+    return json(filtered.slice(0, 500))
   }
 
   if (req.method === 'POST' && /^\/postings\/\d+\/status$/.test(path)) {
