@@ -333,7 +333,7 @@ export async function runNotifyPass(env: Env, kind = 'scheduled'): Promise<RunSu
     const matched = pending.filter((p) => {
       if (!wantedRoles.has(p.roleType)) return false
       if (!matchesLocation(p.location, settings.locations, settings.remoteOk)) return false
-      if (!functionAllowed(p.title, p.roleType, settings.functions)) return false
+      if (!functionAllowed(p.title, p.roleType, settings.functions, p.description)) return false
       if (!degreeAllowed(degreeRequirement(p.title, p.description), settings.degreeLevel)) return false
       return true
     })

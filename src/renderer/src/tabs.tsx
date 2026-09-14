@@ -786,7 +786,7 @@ export function Settings({ onSaved }: { onSaved: () => void }): JSX.Element {
 
       <Card title="Job function">
         <div className="flex flex-wrap gap-2">
-          {(['engineering', 'data', 'product', 'design'] as const).map((f) => {
+          {(['engineering', 'data', 'hardware', 'product', 'design'] as const).map((f) => {
             const active = s.functions.includes(f)
             return (
               <Chip
@@ -796,14 +796,14 @@ export function Settings({ onSaved }: { onSaved: () => void }): JSX.Element {
                   void save({ functions: active ? s.functions.filter((x) => x !== f) : [...s.functions, f] })
                 }
               >
-                {f}
+                {f === 'engineering' ? 'software' : f}
               </Chip>
             )
           })}
         </div>
         <p className="mt-2 text-xs text-on-surface-variant">
-          Only postings confidently identified as non-technical are excluded — an oddly-titled
-          technical role or a fellowship is never dropped just for lacking obvious keywords.
+          A title with no function keywords is judged by its description instead, so an
+          oddly-titled technical role still gets through. Fellowships are never filtered.
         </p>
       </Card>
 

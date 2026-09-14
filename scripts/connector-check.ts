@@ -133,6 +133,20 @@ eq('Recruiting intern is business', detectFunction('Recruiting Intern'), 'busine
 eq('Customer Success is business', detectFunction('Customer Success Intern'), 'business')
 eq('Product Manager is product', detectFunction('Product Management Intern'), 'product')
 eq('UX designer is design', detectFunction('UX Design Intern'), 'design')
+eq('Mechanical engineering is hardware', detectFunction('Mechanical Engineering Intern'), 'hardware')
+eq('Electrical engineer is hardware', detectFunction('Electrical Engineer Intern'), 'hardware')
+eq('Hardware engineer is hardware', detectFunction('Hardware Engineering Intern'), 'hardware')
+// Amazon lists dozens of these; they're fulfillment-center ops roles, not SWE.
+eq('Operations Engineering is hardware', detectFunction('Operations Engineering Intern - start date Q3 2027'), 'hardware')
+eq('Product Development is not software', detectFunction('Product Development Intern') !== 'engineering', true)
+eq('Business Systems is not software', detectFunction('Business Systems Intern') !== 'engineering', true)
+eq('IT help desk is business', detectFunction('IT Help Desk Intern'), 'business')
+
+console.log('\n[function detection — description breaks a silent title]')
+eq('CS-heavy description -> engineering',
+  detectFunction('Summer Intern 2027', 'You will write code in Python and study algorithms with our team.'), 'engineering')
+eq('company boilerplate alone is not enough',
+  detectFunction('Operations Intern', 'We build software for the world. Help our ops team run events.'), 'other')
 
 console.log('\n[degree requirement]')
 eq('PhD in title', degreeRequirement('Research Scientist Intern, PhD'), 'phd')
@@ -189,6 +203,25 @@ console.log('\n[filters — function + degree]')
   })
   check('fellowship survives the engineering filter', kept.some((p) => p.title === 'American Tech Fellowship'))
   check('unknown-function internship survives', kept.some((p) => p.title === 'Deployment Strategist, Internship'))
+
+  // With a description to judge by, a silent title is kept only if the work is technical.
+  const described = applyFilters(
+    [
+      mk('Summer Intern', 'Help our events team plan the annual offsite and manage vendor logistics.'),
+      mk('Deployment Strategist, Internship', 'Computer science background; you will write code in Python against our APIs.')
+    ],
+    { locations: [], remoteOk: true, wantIntern: true, wantNewGrad: true, wantProgram: true, functions: ['engineering'] }
+  )
+  check('non-technical silent title dropped', !described.some((p) => p.title === 'Summer Intern'))
+  check('technical silent title kept via description', described.some((p) => p.title === 'Deployment Strategist, Internship'))
+
+  const sweOnly = applyFilters(
+    [mk('Software Engineer Intern'), mk('Mechanical Engineering Intern'), mk('Data Scientist Intern')],
+    { locations: [], remoteOk: true, wantIntern: true, wantNewGrad: true, wantProgram: true, functions: ['engineering'] }
+  )
+  check('SWE-only keeps SWE', sweOnly.some((p) => p.title === 'Software Engineer Intern'))
+  check('SWE-only drops mechanical', !sweOnly.some((p) => p.title === 'Mechanical Engineering Intern'))
+  check('SWE-only drops data science', !sweOnly.some((p) => p.title === 'Data Scientist Intern'))
 
   const bachelorOnly = applyFilters(set, {
     locations: [], remoteOk: true, wantIntern: true, wantNewGrad: true, wantProgram: true,

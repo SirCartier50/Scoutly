@@ -112,16 +112,44 @@ export function classify(title: string, description?: string | null): Classifica
 
 /* --------------------------------------------------------------- function */
 
-export type JobFunction = 'engineering' | 'data' | 'product' | 'design' | 'business' | 'other'
+/**
+ * `engineering` means SOFTWARE engineering - the id is kept (rather than
+ * renamed to "software") so settings already saved with it keep working.
+ * Non-software engineering disciplines are `hardware`.
+ */
+export type JobFunction = 'engineering' | 'data' | 'hardware' | 'product' | 'design' | 'business' | 'other'
 
 /**
- * Engineering vocabulary, deliberately covering the synonym spread that job
+ * Software vocabulary, deliberately covering the synonym spread that job
  * boards actually use. "Software Development Intern", "SDE Intern", "Programmer
  * Analyst" and "Software Engineer Intern" are the same role wearing four names,
  * and matching only "software engineer" silently drops three of them.
+ *
+ * Bare generic words ("development", "systems", "platform", "security",
+ * "network", "automation", "cloud") used to count on their own and let in
+ * "Product Development Intern", "Business Systems Intern" and friends. They
+ * now only count as part of a software phrase; a title left with no signal
+ * falls through to the description check in detectFunction.
  */
 const ENGINEERING =
-  /\b(software|swe\b|sde\b|sdet\b|engineer(ing)?|developer|development|programmer|coding|backend|back[\s-]end|frontend|front[\s-]end|full[\s-]?stack|devops|sre\b|site\s+reliability|infrastructure|platform|systems?|embedded|firmware|hardware|silicon|asic|fpga|compiler|kernel|distributed|cloud|security|cryptography|appsec|network(ing)?|mobile|ios\b|android|web\s+dev|qa\b|quality\s+assurance|test\s+engineer|automation|robotics|computer\s+vision|machine\s+learning|\bml\b|\bai\b|deep\s+learning|nlp\b|research\s+engineer|data\s+engineer|database)\b/i
+  /\b(software|swe|sde|sdet|engineer(ing)?|developer|programmer|coding|back[\s-]?end|front[\s-]?end|full[\s-]?stack|devops|sre|site\s+reliability|(web|app|application|game|mobile)\s+development|embedded|firmware|compiler|kernel|distributed\s+systems|operating\s+systems|cybersecurity|cryptography|appsec|mobile|ios|android|qa|quality\s+assurance|test\s+automation|robotics|computer\s+vision|computer\s+science|machine\s+learning|ml|ai|deep\s+learning|nlp|database)\b/i
+
+/**
+ * Non-software engineering. Checked BEFORE the software pattern, because
+ * "engineer" alone matches "Mechanical Engineering Intern" just as readily as
+ * "Software Engineering Intern" - the discipline word is what separates them.
+ */
+const HARDWARE_FN =
+  /\b(mechanical|electrical|civil|chemical|structural|aerospace|biomedical|mechatronics|manufacturing|hardware|silicon|asic|fpga|vlsi|semiconductor|pcb|circuit|analog|rf|photonics|optical|nuclear|petroleum|mining|construction|materials\s+(science|engineer(ing)?)|process\s+engineer(ing)?|industrial\s+engineer(ing)?|operations\s+engineer(ing)?|environmental\s+engineer(ing)?|quality\s+engineer(ing)?|power\s+(electronics|systems))\b/i
+
+/**
+ * Only consulted when the title carries no function signal at all. Kept to
+ * phrases that describe the WORK, not the company - "software" alone shows up
+ * in every tech company's boilerplate, so it doesn't count here. Two distinct
+ * hits are required for the same reason.
+ */
+const SOFTWARE_DESC =
+  /\b(computer\s+science|programming|coding|python|java|javascript|typescript|golang|algorithms?|data\s+structures|software\s+(engineering|development)|write\s+code|codebase)\b/gi
 
 /** Technical-but-not-software roles the user still likely wants. */
 const DATA_FN = /\b(data\s+(scientist|science|analyst|engineer)|analytics|quantitative|statistician|machine\s+learning|\bml\b)\b/i
@@ -134,7 +162,7 @@ const DESIGN_FN = /\b(designer|design\b|\bux\b|\bui\b|user\s+experience|user\s+r
 
 /** Non-technical functions that dominate the false positives. */
 const BUSINESS_FN =
-  /\b(sales|account\s+(executive|manager)|business\s+development|\bbd\b|marketing|growth\s+marketing|content|social\s+media|communications|\bpr\b|finance|accounting|controller|treasury|audit|tax|legal|counsel|paralegal|compliance\s+analyst|human\s+resources|\bhr\b|people\s+ops|recruit(er|ing)|customer\s+(success|support|experience)|support\s+specialist|operations\s+(associate|specialist|coordinator)|supply\s+chain|procurement|facilities|administrative|executive\s+assistant|office\s+manager|community\s+manager|partnerships)\b/i
+  /\b(sales|account\s+(executive|manager)|business\s+development|\bbd\b|marketing|growth\s+marketing|content|social\s+media|communications|\bpr\b|finance|accounting|controller|treasury|audit|tax|legal|counsel|paralegal|compliance\s+analyst|human\s+resources|\bhr\b|people\s+ops|recruit(er|ing)|customer\s+(success|support|experience)|support\s+specialist|operations\s+(associate|specialist|coordinator)|supply\s+chain|procurement|facilities|administrative|executive\s+assistant|office\s+manager|community\s+manager|partnerships|it\s+support|help\s*desk|desktop\s+support)\b/i
 
 /**
  * Business vocabulary wins ties: "Sales Engineer" and "Solutions Engineer" are
@@ -143,15 +171,25 @@ const BUSINESS_FN =
  */
 const SALES_ENGINEER = /\b(sales|solutions|customer|field|partner|pre[\s-]?sales)\s+engineer/i
 
-export function detectFunction(title: string): JobFunction {
+export function detectFunction(title: string, description?: string | null): JobFunction {
   const t = title.trim()
 
   if (SALES_ENGINEER.test(t)) return 'business'
   if (BUSINESS_FN.test(t)) return 'business'
+  if (HARDWARE_FN.test(t)) return 'hardware'
   if (ENGINEERING.test(t)) return 'engineering'
   if (DATA_FN.test(t)) return 'data'
   if (PRODUCT_FN.test(t)) return 'product'
   if (DESIGN_FN.test(t)) return 'design'
+
+  // Title says nothing ("Summer Intern 2027", "Deployment Strategist,
+  // Internship") - let the description break the tie, same rule classify() uses.
+  if (description) {
+    const hits = new Set(
+      [...description.slice(0, 6000).matchAll(SOFTWARE_DESC)].map((m) => m[0].toLowerCase().replace(/\s+/g, ' '))
+    )
+    if (hits.size >= 2) return 'engineering'
+  }
   return 'other'
 }
 
@@ -310,33 +348,36 @@ export function applyFilters(
   return postings.filter((p) => {
     if (!wanted.has(p.roleType)) return false
     if (!matchesLocation(p.location, prefs.locations, prefs.remoteOk)) return false
-    if (!functionAllowed(p.title, p.roleType, fns)) return false
+    if (!functionAllowed(p.title, p.roleType, fns, p.description)) return false
     if (!degreeAllowed(degreeRequirement(p.title, p.description), prefs.degreeLevel ?? null)) return false
     return true
   })
 }
 
 /**
- * Function filtering EXCLUDES what we're confident is non-technical rather than
- * requiring confident technical detection.
+ * Measured on live boards, a title-only strict filter dropped "American Tech
+ * Fellowship" and Palantir's "Deployment Strategist, Internship" - real
+ * technical early-career roles whose titles carry no engineering vocabulary.
+ * Keeping EVERY unknown title fixed that, but flooded digests with
+ * "Operations Intern" / "Summer Intern" noise for anyone who only wants SWE.
  *
- * Measured on live boards, the strict form dropped "American Tech Fellowship"
- * and Palantir's "Deployment Strategist, Internship" - real technical
- * early-career roles whose titles carry no engineering vocabulary. An unknown
- * function is therefore kept: a missed internship costs far more than a
- * spurious one. Fellowships and programs bypass the filter entirely, since
- * their titles almost never name a function.
+ * The middle ground: an unknown title gets a second look at its description
+ * (see detectFunction). Only if there's no description to look at is it kept
+ * on benefit of the doubt - with a description that shows no technical work,
+ * it's dropped. Programs still bypass the filter, since their titles almost
+ * never name a function.
  */
 export function functionAllowed(
   title: string,
   roleType: RoleType,
-  wantedFunctions: JobFunction[]
+  wantedFunctions: JobFunction[],
+  description?: string | null
 ): boolean {
   if (wantedFunctions.length === 0) return true
   if (roleType === 'program') return true
 
-  const fn = detectFunction(title)
-  if (fn === 'other') return true // unknown is not a reason to drop
+  const fn = detectFunction(title, description)
+  if (fn === 'other') return !description
   return wantedFunctions.includes(fn)
 }
 
@@ -349,7 +390,7 @@ export function maybePostings(
   return postings.filter((p) => {
     if (!p.needsTriage) return false
     if (!matchesLocation(p.location, prefs.locations, prefs.remoteOk)) return false
-    if (!functionAllowed(p.title, p.roleType, fns)) return false
+    if (!functionAllowed(p.title, p.roleType, fns, p.description)) return false
     return true
   })
 }
