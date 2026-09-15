@@ -14,7 +14,10 @@ export function Card({
   className?: string
 }): JSX.Element {
   return (
-    <section className={`glass rounded-card p-5 ${className}`}>
+    // min-w-0: Cards are almost always grid/flex items, which default to
+    // min-width:auto - so any long unbreakable child (a truncated posting
+    // title, a URL) widens the card past the window instead of shrinking.
+    <section className={`glass min-w-0 rounded-card p-5 ${className}`}>
       {(title || action) && (
         <div className="mb-4 flex items-center gap-3">
           {title && <h2 className="flex-1 text-sm font-medium text-on-surface-variant">{title}</h2>}
