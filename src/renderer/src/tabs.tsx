@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
 import type { SeedSuggestion, UiPosting, UiProgram, UiSettings } from '@shared/ipc'
-import type { AppStatus, Company } from '@shared/types'
+import type { Company } from '@shared/types'
 import {
-  Button, Card, Chip, Empty, HealthDot, RoleBadge, TextField, Toggle,
-  postedLabel, relativeTime
+  Button, Card, Chip, Empty, RoleBadge, TextField, Toggle,
+  postedLabel
 } from './ui'
 
 /* ============================================================== Dashboard */
 
 /**
  * Data only, per explicit feedback: no watcher health, no spend meter, no
- * "Check now" - those live in Admin now. This tab answers "what's new and
- * where do I stand", nothing about the plumbing that produced it.
+ * "Check now" anywhere in this app - that's operator plumbing, not something
+ * a job seeker needs. This tab answers "what's new and where do I stand".
  */
 export function Dashboard({ onGoto }: { onGoto: (tab: string) => void }): JSX.Element {
   const [fresh, setFresh] = useState<UiPosting[] | null>(null)
@@ -208,8 +208,11 @@ export function Postings(): JSX.Element {
   }
 
   return (
-    <div className="grid gap-5 lg:grid-cols-[1fr_420px]">
-      <Card>
+    // minmax(0,1fr) + min-w-0, not plain 1fr: grid columns default to
+    // min-width:auto, so one long title's unwrapped width propped the whole
+    // column open past the window even though the text itself truncates.
+    <div className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-5 lg:grid-cols-[minmax(0,1fr)_420px]">
+      <Card className="min-w-0">
         <div className="mb-4 flex flex-wrap items-center gap-2">
           {!showMaybe &&
             ROLE_FILTERS.map((f) => (
@@ -257,7 +260,7 @@ export function Postings(): JSX.Element {
       <Card title={selected ? 'Details' : undefined} className="h-fit lg:sticky lg:top-0">
         {selected ? (
           <div>
-            <h3 className="text-base font-semibold leading-snug">{selected.title}</h3>
+            <h3 className="break-words text-base font-semibold leading-snug">{selected.title}</h3>
             <p className="mt-1 text-sm text-on-surface-variant">
               {selected.companyName}
               {selected.location ? ` · ${selected.location}` : ''}
@@ -318,9 +321,9 @@ function PostingList({
   showDeadline?: boolean
 }): JSX.Element {
   return (
-    <ul className="grid gap-2">
+    <ul className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-2">
       {postings.map((p) => (
-        <li key={p.id}>
+        <li key={p.id} className="min-w-0">
           <button
             onClick={() => (onSelect ? onSelect(p) : void window.api.openExternal(p.applyUrl))}
             className={`w-full rounded-panel px-3 py-2.5 text-left transition-colors ${
@@ -488,15 +491,7 @@ export function Companies({ onChanged }: { onChanged: () => void }): JSX.Element
           <ul className="grid max-h-[52vh] gap-1 overflow-y-auto">
             {watched.map((c) => (
               <li key={c.id} className="flex items-center gap-3 rounded-panel px-3 py-2 hover:bg-surface-container-high">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{c.name}</div>
-                  <div className="truncate text-xs text-on-surface-variant">
-                    {c.atsType}
-                    {c.lastYield !== null ? ` · ${c.lastYield} matching` : ''}
-                    {c.lastOkAt ? ` · ${relativeTime(c.lastOkAt)}` : ' · never checked'}
-                  </div>
-                </div>
-                <HealthDot health={c.health} />
+                <div className="min-w-0 flex-1 truncate text-sm font-medium">{c.name}</div>
                 <Button variant="text" onClick={() => void window.api.setWatched(c.id, false).then(reload)}>
                   Remove
                 </Button>
@@ -573,93 +568,6 @@ export function Companies({ onChanged }: { onChanged: () => void }): JSX.Element
           </div>
         </Card>
       </div>
-    </div>
-  )
-}
-
-/* ================================================================== Admin */
-
-/**
- * Everything that's about the plumbing rather than the postings themselves:
- * watcher health, manual check trigger, connection status. Moved off the
- * dashboard on purpose.
- */
-export function Admin({ status, onChecked }: { status: AppStatus | null; onChecked: () => void }): JSX.Element {
-  const [companies, setCompanies] = useState<Company[]>([])
-  const [checking, setChecking] = useState(false)
-  const [note, setNote] = useState<string | null>(null)
-
-  const reload = useCallback(() => {
-    void window.api.listCompanies().then(setCompanies)
-  }, [])
-
-  useEffect(reload, [reload])
-
-  const checkNow = async (): Promise<void> => {
-    setChecking(true)
-    setNote(null)
-    try {
-      const res = await window.api.runCheckNow()
-      setNote(res.started ? 'Check started on the server.' : (res.reason ?? 'Could not start'))
-      onChecked()
-      setTimeout(reload, 3000)
-    } finally {
-      setChecking(false)
-    }
-  }
-
-  const watched = companies.filter((c) => c.watched)
-  const broken = watched.filter((c) => c.health === 'broken')
-  const stale = watched.filter((c) => c.health === 'stale')
-
-  return (
-    <div className="grid gap-5">
-      <Card title="Server">
-        <div className="flex items-center gap-4">
-          <div className="flex-1 text-sm text-on-surface-variant">
-            The server checks every hour on its own, whether or not this app is open.
-          </div>
-          <Button onClick={() => void checkNow()} disabled={checking}>
-            {checking ? 'Checking…' : 'Check now'}
-          </Button>
-        </div>
-        {note && <p className="mt-2 text-xs text-on-surface-variant">{note}</p>}
-        {status?.lastRun && (
-          <p className="mt-2 text-xs text-on-surface-variant">
-            Last run: {relativeTime(status.lastRun.startedAt)} · {status.lastRun.newPostings} new ·{' '}
-            {status.lastRun.companiesChecked} checked
-            {status.lastRun.errors > 0 && ` · ${status.lastRun.errors} errors`}
-          </p>
-        )}
-      </Card>
-
-      <Card title="Watcher health">
-        <div className="flex gap-6 text-sm">
-          <Health n={status?.health.ok ?? 0} label="ok" className="text-positive" />
-          <Health n={status?.health.stale ?? 0} label="stale" className="text-warning" />
-          <Health n={status?.health.broken ?? 0} label="broken" className="text-danger" />
-        </div>
-
-        {(broken.length > 0 || stale.length > 0) && (
-          <ul className="mt-4 grid gap-1">
-            {[...broken, ...stale].map((c) => (
-              <li key={c.id} className="flex items-center gap-3 rounded-panel px-3 py-2 hover:bg-surface-container-high">
-                <div className="min-w-0 flex-1 truncate text-sm">{c.name}</div>
-                <HealthDot health={c.health} />
-              </li>
-            ))}
-          </ul>
-        )}
-      </Card>
-    </div>
-  )
-}
-
-function Health({ n, label, className }: { n: number; label: string; className: string }): JSX.Element {
-  return (
-    <div>
-      <div className={`text-2xl font-semibold ${className}`}>{n}</div>
-      <div className="text-xs text-on-surface-variant">{label}</div>
     </div>
   )
 }
