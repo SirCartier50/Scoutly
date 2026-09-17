@@ -233,10 +233,10 @@ export const workday: Connector = {
     const origin = new URL(endpoint).origin
     const sitePath = endpoint.replace(/^.*\/wday\/cxs\/[^/]+\//, '').replace(/\/jobs$/, '')
 
-    const out: RawPosting[] = []
     const limit = 20
+    const seen = new Map<string, RawPosting>()
 
-    for (let page = 0; page < 50; page++) {
+    const page = async (offset: number, searchText: string): Promise<{ total: number; batch: WdPosting[] }> => {
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: {
@@ -244,15 +244,14 @@ export const workday: Connector = {
           accept: 'application/json',
           'user-agent': 'career-watch/0.1 (personal job-posting tracker)'
         },
-        body: JSON.stringify({ appliedFacets: {}, limit, offset: page * limit, searchText: '' })
+        body: JSON.stringify({ appliedFacets: {}, limit, offset, searchText })
       })
       if (!res.ok) throw new HttpError(`workday HTTP ${res.status}`, res.status, res.status >= 500)
-
       const body = (await res.json()) as { total?: number; jobPostings?: WdPosting[] }
       const batch = body.jobPostings ?? []
-
       for (const p of batch) {
-        out.push({
+        if (seen.has(p.externalPath)) continue
+        seen.set(p.externalPath, {
           externalId: p.externalPath,
           title: p.title ?? '(untitled)',
           location: str(p.locationsText),
@@ -263,14 +262,44 @@ export const workday: Connector = {
           department: null
         })
       }
-
-      if (batch.length < limit) break
-      if (body.total && (page + 1) * limit >= body.total) break
+      return { total: body.total ?? 0, batch }
     }
 
-    return out
+    // The first page is always fetched unfiltered: it reports the board's
+    // total, and its postings prove the feed works even when no early-career
+    // role happens to be open (which is what health is measured on).
+    const first = await page(0, '')
+
+    if (first.total <= FULL_LISTING_MAX) {
+      // Small enough to list completely, which also catches oddly-titled
+      // roles a keyword search would miss. At most 20 requests.
+      for (let offset = limit; offset < first.total && first.batch.length === limit; offset += limit) {
+        const next = await page(offset, '')
+        if (next.batch.length < limit) break
+      }
+    } else {
+      // Large boards (Nike, Target, the banks run into the thousands) can't be
+      // paged within the Worker's 50-subrequest budget. Search the
+      // early-career vocabulary instead - a title with none of these words
+      // classifies as "other" and would be discarded anyway.
+      for (const query of EARLY_CAREER_QUERIES) {
+        for (let p = 0; p < 3; p++) {
+          const res = await page(p * limit, query)
+          if (res.batch.length < limit || (p + 1) * limit >= res.total) break
+        }
+      }
+    }
+
+    return [...seen.values()]
   }
 }
+
+/**
+ * Boards up to this size are listed in full (at most 20 requests); larger
+ * ones switch to early-career keyword search. Keeps every Workday company
+ * inside one queue invocation's 50-subrequest budget with room to spare.
+ */
+const FULL_LISTING_MAX = 400
 
 /* -------------------------------------------------------------- oraclehcm */
 
@@ -980,10 +1009,227 @@ export const mcloud: Connector = {
   }
 }
 
+/* ----------------------------------------------------------- successfactors */
+
+/**
+ * SAP SuccessFactors "Career Site Builder" sites: the careers.<brand> hosts of
+ * Coty, Sephora, Under Armour, McDonald's, Hershey, PwC, EY, BMW, Paramount...
+ * There is no public JSON API, but every one of these sites publishes two
+ * things this can use, and boardToken is simply the site's host.
+ *
+ * 1. /sitemap.xml, which on most of them is a plain list of every job URL -
+ *    and the URL slug carries the title ("Singapore-Retail-Commercial-
+ *    Analyst-Intern-01-238164"). One request sees the whole board; the
+ *    classifier picks the early-career candidates from the slugs; only those
+ *    get their detail page fetched for the real title, location, date and
+ *    description. That's what keeps a board like EY's (8,000+ jobs) inside
+ *    the Worker's 50-subrequest budget.
+ *
+ * 2. On a few (Sephora, ExxonMobil, John Deere) /sitemap.xml is instead a
+ *    Google-Base RSS feed with every job's full description inline - 4 to 16
+ *    MB, more CPU than a free-plan Worker should spend parsing. The format is
+ *    sniffed from the first chunk and the download cancelled; the site's own
+ *    search is used for early-career keywords instead.
+ */
+const SF_MAX_DETAILS = 30
+const SF_PAGE = 25
+
+interface SfJobRef {
+  id: string
+  url: string
+  /** Title words recovered from the URL slug or the search listing - classification only. */
+  hint: string
+}
+
+const decodeEntitiesLite = (s: string): string =>
+  s
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, (_, d: string) => String.fromCharCode(Number(d)))
+
+/** Reads a body until the format is known; returns the full text only for a plain sitemap. */
+async function readSitemapIfPlain(url: string): Promise<string | null> {
+  const res = await httpGet(url, { accept: 'application/xml,text/xml', retries: 1 })
+  const reader = res.body?.getReader()
+  if (!reader) return null
+  const decoder = new TextDecoder()
+  let text = ''
+  let format: 'plain' | 'rss' | null = null
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    text += decoder.decode(value, { stream: true })
+    if (format === null && text.length > 256) {
+      format = /<rss\b/i.test(text.slice(0, 2048)) ? 'rss' : /<urlset\b|<loc>/i.test(text.slice(0, 4096)) ? 'plain' : null
+      if (format === 'rss') {
+        await reader.cancel()
+        return null
+      }
+    }
+  }
+  // An RSS feed returns from inside the loop, so reaching here means plain.
+  return text
+}
+
+const SF_US_SLUG =
+  /\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC)\s\d{5}\s*$/
+
+/** Whether a job URL looks US-based: "/USA/job/...", "...-CA-USA_520094", or "...-MD-21230". */
+const sfLooksUS = (r: SfJobRef): boolean => /\/USA\/job\/|[-_ ]USA[-_ ]/i.test(r.url) || SF_US_SLUG.test(r.hint)
+
+function sfRefsFromSitemap(xml: string): SfJobRef[] {
+  const refs = new Map<string, SfJobRef>()
+  for (const m of xml.matchAll(/<loc>\s*(?:<!\[CDATA\[)?\s*([^<\]\s]+)\s*(?:\]\]>)?\s*<\/loc>/g)) {
+    const url = decodeEntitiesLite(m[1] as string)
+    const j = /\/job\/([^/]+)\/(\d+)\/?$/.exec(url)
+    if (!j) continue
+    let slug = j[1] as string
+    try {
+      slug = decodeURIComponent(slug)
+    } catch {
+      // keep the raw slug
+    }
+    refs.set(j[2] as string, { id: j[2] as string, url, hint: slug.replace(/-/g, ' ') })
+  }
+  return [...refs.values()]
+}
+
+function sfRefsFromSearch(html: string, origin: string): SfJobRef[] {
+  const refs = new Map<string, SfJobRef>()
+  // Attribute order differs between the "tile" and classic table templates.
+  for (const m of html.matchAll(/<a\b([^>]*)>\s*([^<]+?)\s*<\/a>/g)) {
+    const attrs = m[1] as string
+    if (!/class="[^"]*jobTitle-link/.test(attrs)) continue
+    // Some sites prefix a locale section: /USA/job/..., /Canada/job/...
+    const href = /href="((?:\/[^"/]+)?\/job\/[^"]*?\/(\d+)\/?)"/.exec(attrs)
+    if (!href) continue
+    refs.set(href[2] as string, {
+      id: href[2] as string,
+      url: `${origin}${href[1]}`,
+      hint: decodeEntitiesLite(m[2] as string)
+    })
+  }
+  return [...refs.values()]
+}
+
+/** The element's inner HTML, matching nested tags of the same name. */
+function innerOfElementAt(html: string, start: number): string | null {
+  const open = /<([a-z0-9]+)\b[^>]*>/i.exec(html.slice(start))
+  if (!open) return null
+  const tag = (open[1] as string).toLowerCase()
+  const re = new RegExp(`<(/?)${tag}\\b[^>]*>`, 'gi')
+  re.lastIndex = start + open.index + open[0].length
+  let depth = 1
+  for (let m = re.exec(html); m; m = re.exec(html)) {
+    depth += m[1] ? -1 : 1
+    if (depth === 0) return html.slice(start + open.index + open[0].length, m.index)
+  }
+  return null
+}
+
+async function sfDetail(ref: SfJobRef): Promise<RawPosting> {
+  const html = await getText(ref.url, { retries: 1 })
+  const pick = (re: RegExp): string | null => {
+    const m = re.exec(html)
+    return m ? str(decodeEntitiesLite(m[1] as string)) : null
+  }
+
+  const dateRaw = pick(/itemprop="datePosted"[^>]*content="([^"]+)"/)
+  const posted = dateRaw && !Number.isNaN(Date.parse(dateRaw)) ? new Date(dateRaw).toISOString() : null
+
+  let description: string | null = null
+  const at = html.search(/<[a-z]+[^>]*itemprop="description"/i)
+  if (at >= 0) {
+    const inner = innerOfElementAt(html, at)
+    if (inner) description = str(htmlToText(inner))
+  }
+
+  return {
+    externalId: ref.id,
+    title: pick(/itemprop="title"[^>]*>\s*([^<]+)/) ?? pick(/property="og:title"\s+content="([^"]+)"/) ?? ref.hint,
+    location: pick(/class="jobGeoLocation"[^>]*>\s*([^<]+)/) ?? pick(/itemprop="addressLocality"[^>]*content="([^"]+)"/),
+    applyUrl: ref.url,
+    postedAt: posted,
+    description,
+    department: null
+  }
+}
+
+export const successfactors: Connector = {
+  type: 'successfactors',
+  async fetch(t) {
+    const host = t.boardToken
+    if (!host) throw new HttpError('successfactors connector requires the career site host as its board token', null, false)
+    const origin = `https://${host}`
+
+    let refs: SfJobRef[] = []
+    const sitemap = await readSitemapIfPlain(`${origin}/sitemap.xml`)
+    if (sitemap !== null) {
+      refs = sfRefsFromSitemap(sitemap)
+    }
+
+    if (refs.length === 0) {
+      // RSS-format sitemap (or none): search the early-career vocabulary.
+      const seen = new Map<string, SfJobRef>()
+      for (const query of ['intern', 'graduate', 'early career', 'apprentice']) {
+        for (let p = 0; p < 3; p++) {
+          const html = await getText(`${origin}/search/?q=${encodeURIComponent(query)}&startrow=${p * SF_PAGE}`, { retries: 1 })
+          const found = sfRefsFromSearch(html, origin)
+          const before = seen.size
+          for (const r of found) if (!seen.has(r.id)) seen.set(r.id, r)
+          if (found.length < SF_PAGE || seen.size === before) break
+        }
+      }
+      refs = [...seen.values()]
+    }
+
+    // Detail pages only for what the classifier would keep - the slug or
+    // listing title is enough to decide that, not enough to store. Global
+    // boards (EY lists 70+ early-career roles worldwide) can exceed the detail
+    // budget, so US roles go first: their slugs end in "-<state>-<ZIP>" or
+    // carry "USA", which is a reliable enough signal to order by.
+    const candidates = refs
+      .filter((r) => {
+        const c = classify(r.hint)
+        return c.roleType !== 'other' || c.needsTriage
+      })
+      .sort((a, b) => Number(sfLooksUS(b)) - Number(sfLooksUS(a)))
+    const chosen = new Set(candidates.slice(0, SF_MAX_DETAILS).map((r) => r.id))
+
+    const out: RawPosting[] = []
+    for (const ref of refs) {
+      if (chosen.has(ref.id)) {
+        try {
+          out.push(await sfDetail(ref))
+          continue
+        } catch {
+          // Fall through to the listing-only record rather than lose the job.
+        }
+      }
+      // Not a candidate: returned so health can see the board is alive, with
+      // the hint as title. It classifies as "other" and is never stored.
+      out.push({
+        externalId: ref.id,
+        title: ref.hint,
+        location: null,
+        applyUrl: ref.url,
+        postedAt: null,
+        description: null,
+        department: null
+      })
+    }
+    return out
+  }
+}
+
 const REGISTRY: Partial<Record<AtsType, Connector>> = {
   greenhouse,
   eightfold,
   mcloud,
+  successfactors,
   lever,
   ashby,
   smartrecruiters,

@@ -25,7 +25,7 @@ const ENDPOINTS: Record<
   // guessing a slug - each needs a company-specific domain or org id.
   Exclude<
     AtsType,
-    'workday' | 'oraclehcm' | 'eightfold' | 'mcloud' | 'careerpage' | 'amazonjobs' | 'microsoftjobs' | 'googlejobs' | 'applejobs' | 'unknown'
+    'workday' | 'oraclehcm' | 'eightfold' | 'mcloud' | 'successfactors' | 'careerpage' | 'amazonjobs' | 'microsoftjobs' | 'googlejobs' | 'applejobs' | 'unknown'
   >,
   { url: (t: string) => string; count: (j: unknown) => number | null }
 > = {
@@ -99,7 +99,7 @@ export async function probeCareerPage(careersUrl: string): Promise<ProbeResult |
     const token = m?.[1]
     if (!token) continue
     if (
-      ats === 'workday' || ats === 'oraclehcm' || ats === 'eightfold' || ats === 'mcloud' ||
+      ats === 'workday' || ats === 'oraclehcm' || ats === 'eightfold' || ats === 'mcloud' || ats === 'successfactors' ||
       ats === 'careerpage' || ats === 'amazonjobs' || ats === 'microsoftjobs' || ats === 'googlejobs' ||
       ats === 'applejobs' || ats === 'unknown'
     ) continue

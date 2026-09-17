@@ -343,6 +343,80 @@ for (const c of [
   }
 }
 
+console.log('\n[workday — subrequest budget on a huge board]')
+// Regression: large Workday boards were paged in full - up to 50 requests for
+// ONE company - which blew the Worker's 50-subrequest-per-invocation limit and
+// took 892 companies down with "Too many subrequests". A board over the full-
+// listing threshold must now stay well inside that budget and still surface
+// its early-career roles via search.
+{
+  const realFetch = globalThis.fetch
+  let requests = 0
+  globalThis.fetch = ((...a: Parameters<typeof fetch>) => {
+    requests++
+    return realFetch(...a)
+  }) as typeof fetch
+  try {
+    const res = await fetchCompany(target({
+      name: 'Nike',
+      atsType: 'workday',
+      careersUrl: 'https://nike.wd1.myworkdayjobs.com/nke',
+      parseConfig: { kind: 'json-endpoint', url: 'https://nike.wd1.myworkdayjobs.com/wday/cxs/nike/nke/jobs' }
+    }))
+    check('Nike (huge Workday board): fetch succeeded', res.ok, res.error)
+    check(`Nike: stays inside the 50-subrequest budget (${requests} requests)`, requests <= 40, String(requests))
+    check('Nike: returns postings', res.postings.length > 0)
+    const early = res.postings.map(classifyPosting).filter((p) => p.roleType !== 'other')
+    console.log(`        Nike: ${requests} requests, ${res.postings.length} postings, ${early.length} early-career`)
+    for (const e of early.slice(0, 3)) console.log(`          - [${e.roleType}] ${e.title}`)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+}
+
+console.log('\n[successfactors career site builder — live network]')
+// One connector, four real site shapes: a plain sitemap (Coty, Under Armour),
+// a huge plain sitemap that must stay inside the request budget (EY, 8,000+
+// jobs), and an RSS-format "sitemap" that must be detected and skipped in
+// favour of the site's search (Sephora - downloading it is 16 MB).
+{
+  const realFetch = globalThis.fetch
+  for (const c of [
+    { name: 'Coty', host: 'careers.coty.com' },
+    { name: 'Under Armour', host: 'careers.underarmour.com' },
+    { name: 'EY', host: 'careers.ey.com' },
+    { name: 'Sephora', host: 'jobs.sephora.com' }
+  ]) {
+    let requests = 0
+    globalThis.fetch = ((...a: Parameters<typeof fetch>) => {
+      requests++
+      return realFetch(...a)
+    }) as typeof fetch
+    let res
+    try {
+      res = await fetchCompany(target({ name: c.name, atsType: 'successfactors', careersUrl: `https://${c.host}/`, boardToken: c.host }))
+    } finally {
+      globalThis.fetch = realFetch
+    }
+    check(`${c.name}: fetch succeeded`, res.ok, res.error)
+    if (!res.ok) continue
+    const ps = res.postings
+    check(`${c.name}: returned postings (${ps.length})`, ps.length > 0)
+    check(`${c.name}: stays inside the 50-subrequest budget (${requests} requests)`, requests <= 45, String(requests))
+    check(`${c.name}: every applyUrl is absolute http(s)`, ps.every((p) => /^https?:\/\//.test(p.applyUrl)))
+    check(`${c.name}: external ids are unique`, new Set(ps.map((p) => p.externalId)).size === ps.length)
+    const early = ps.map(classifyPosting).filter((p) => p.roleType !== 'other')
+    const described = early.filter((p) => (p.description ?? '').length > 200)
+    check(`${c.name}: early-career roles have descriptions (${described.length}/${early.length})`, early.length === 0 || described.length > 0)
+    check(
+      `${c.name}: posted dates are real, not epoch garbage`,
+      ps.filter((p) => p.postedAt).every((p) => new Date(p.postedAt as string) > new Date('2000-01-01'))
+    )
+    console.log(`        ${c.name}: ${requests} requests, ${ps.length} jobs seen, ${early.length} early-career`)
+    for (const e of early.slice(0, 3)) console.log(`          - [${e.roleType}] ${e.title} · ${e.location ?? 'no location'}`)
+  }
+}
+
 console.log('\n[search-only platforms — live network]')
 // Big consumer brands that sit on neither a public ATS board nor Workday:
 // Netflix on Eightfold, Victoria's Secret on m-cloud's hosted jobs API. Both

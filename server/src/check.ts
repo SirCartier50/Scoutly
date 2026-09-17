@@ -289,16 +289,23 @@ export async function fetchAndStoreCompany(env: Env, companyId: number): Promise
 
   await syncPostings(db, c.id, toStore)
 
-  // Health reflects whether the CONNECTOR is working, not any user's
-  // personal filters - see the single-user version's note on why this
-  // caused false "broken" reads when measured post-filter instead.
-  const rawEarlyCareerYield = classified.filter((p) => p.roleType !== 'other').length
+  // Health reflects whether the FEED works, so it's measured on every posting
+  // the connector returned - not the early-career subset. Measuring the subset
+  // labelled hundreds of healthy boards "broken" (Airbnb, Pinterest, Jane
+  // Street) simply because no internship happened to be open that day. The
+  // same over-narrow measurement is what the single-user version hit with
+  // per-user filters; this is that fix applied one level further.
+  const totalFetched = outcome.postings.length
+
+  // Search-only platforms return whatever matched the early-career queries,
+  // so zero results is a legitimate answer there, not a sign of breakage.
+  const searchOnly = c.ats_type === 'eightfold' || c.ats_type === 'mcloud'
 
   const history = JSON.parse(c.yield_history) as number[]
   await recordCheck(db, c.id, {
     ok: true,
-    yield: rawEarlyCareerYield,
-    health: evaluateHealth(rawEarlyCareerYield, history, c.consecutive_zero)
+    yield: totalFetched,
+    health: searchOnly ? 'ok' : evaluateHealth(totalFetched, history, c.consecutive_zero)
   })
 }
 

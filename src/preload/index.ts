@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { CHANNELS, EVENTS } from '@shared/ipc'
-import type { IpcApi } from '@shared/ipc'
+import type { IpcApi, UpdateStatus } from '@shared/ipc'
 
 /**
  * The only bridge between the page and Node. Everything is invoke/handle, so
@@ -13,6 +13,7 @@ const call = <T>(channel: string, ...args: unknown[]): Promise<T> =>
 const api: IpcApi & {
   onRunFinished(cb: () => void): () => void
   onRunStarted(cb: () => void): () => void
+  onUpdateStatus(cb: (s: UpdateStatus) => void): () => void
 } = {
   getStatus: () => call(CHANNELS.getStatus),
   runCheckNow: () => call(CHANNELS.runCheckNow),
@@ -41,6 +42,10 @@ const api: IpcApi & {
   listMaybePostings: () => call(CHANNELS.listMaybePostings),
   setPostingStatus: (id, status, note) => call(CHANNELS.setPostingStatus, id, status, note),
 
+  getUpdateStatus: () => call(CHANNELS.getUpdateStatus),
+  checkForUpdates: () => call(CHANNELS.checkForUpdates),
+  installUpdate: () => call(CHANNELS.installUpdate),
+
   getProfile: () => call(CHANNELS.getProfile),
   saveProfile: (patch) => call(CHANNELS.saveProfile, patch),
   saveAnswer: (question, answer) => call(CHANNELS.saveAnswer, question, answer),
@@ -66,6 +71,11 @@ const api: IpcApi & {
     const l = (): void => cb()
     ipcRenderer.on(EVENTS.runStarted, l)
     return () => ipcRenderer.off(EVENTS.runStarted, l)
+  },
+  onUpdateStatus(cb) {
+    const l = (_e: unknown, s: UpdateStatus): void => cb(s)
+    ipcRenderer.on(EVENTS.updateStatus, l)
+    return () => ipcRenderer.off(EVENTS.updateStatus, l)
   }
 }
 

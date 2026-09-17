@@ -38,7 +38,13 @@ binding = "FETCH_QUEUE"
 
 [[queues.consumers]]
 queue = "career-watch-fetch"
-max_batch_size = 10
+# ONE company per consumer invocation. The Free plan allows 50 subrequests
+# per invocation, and that budget is shared by everything the invocation does.
+# At 10 per batch, a single large board (Workday pages 20 jobs per request)
+# spent the budget and every company after it in the batch failed with "Too
+# many subrequests" - 892 companies, NVIDIA/Nike/Target among them, were stuck
+# that way. Concurrency, not batch size, is what gives throughput here.
+max_batch_size = 1
 max_batch_timeout = 5
 max_retries = 3
 max_concurrency = 25

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { JSX } from 'react'
 import type { AppStatus } from '@shared/types'
+import type { UpdateStatus } from '@shared/ipc'
 import { Companies, Dashboard, Postings, Programs, Settings } from './tabs'
 import { Resume } from './resume'
 
@@ -38,6 +39,14 @@ export default function App(): JSX.Element {
     return off
   }, [refresh])
 
+  // The banner reads live status: an update can finish downloading minutes
+  // after launch, while the window is already open.
+  const [update, setUpdate] = useState<UpdateStatus | null>(null)
+  useEffect(() => {
+    void window.api.getUpdateStatus().then(setUpdate)
+    return window.api.onUpdateStatus(setUpdate)
+  }, [])
+
   const notConfigured = status !== null && status.watchedCompanies === 0 && status.lastRun === null
 
   return (
@@ -57,6 +66,20 @@ export default function App(): JSX.Element {
         <div className="mx-7 mb-2 rounded-panel bg-danger/15 px-4 py-3 text-sm text-danger">
           <div className="font-medium">Could not talk to the app backend</div>
           <div className="mt-1 font-mono text-xs opacity-80">{fatal}</div>
+        </div>
+      )}
+
+      {update?.state === 'ready' && (
+        <div className="mx-7 mb-2 flex flex-wrap items-center gap-3 rounded-panel bg-primary-container px-4 py-2 text-sm text-on-primary-container">
+          <span className="flex-1">
+            Career Watch {update.availableVersion} is downloaded and ready.
+          </span>
+          <button
+            onClick={() => void window.api.installUpdate()}
+            className="rounded-pill bg-primary px-4 py-1.5 text-xs font-medium text-on-primary"
+          >
+            Restart to update
+          </button>
         </div>
       )}
 

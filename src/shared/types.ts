@@ -11,6 +11,8 @@ export type AtsType =
   | 'eightfold'
   /** m-cloud.io hosted jobs API behind the "CWS" WordPress careers plugin (e.g. Victoria's Secret). */
   | 'mcloud'
+  /** SAP SuccessFactors Career Site Builder; boardToken is the site host (e.g. careers.coty.com). */
+  | 'successfactors'
   | 'careerpage'
   // Dedicated connectors for specific large employers whose custom in-house
   // systems have a real, reverse-engineered JSON endpoint. Unlike the generic

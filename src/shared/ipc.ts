@@ -53,6 +53,23 @@ export interface UiSettings {
   encryptionAvailable: boolean
 }
 
+/* ------------------------------------------------------------------ updates */
+
+export interface UpdateStatus {
+  /**
+   * disabled: running from source, where only git pull + rebuild can update.
+   * downloading/ready: an update was found; ready means restart to install.
+   */
+  state: 'disabled' | 'idle' | 'checking' | 'up-to-date' | 'downloading' | 'ready' | 'error'
+  currentVersion: string
+  availableVersion?: string
+  /** 0-100 while downloading. */
+  progress?: number
+  checkedAt?: string
+  error?: string
+  reason?: string
+}
+
 /* ------------------------------------------------- resume + profile (local) */
 
 /** Answers to the long tail of application questions, reused across applications. */
@@ -165,6 +182,10 @@ export interface IpcApi {
   listMaybePostings(): Promise<UiPosting[]>
   setPostingStatus(id: number, status: string, note?: string): Promise<void>
 
+  getUpdateStatus(): Promise<UpdateStatus>
+  checkForUpdates(): Promise<UpdateStatus>
+  installUpdate(): Promise<void>
+
   getProfile(): Promise<UiProfile>
   saveProfile(patch: Record<string, string>): Promise<void>
   saveAnswer(question: string, answer: string): Promise<void>
@@ -213,6 +234,10 @@ export const CHANNELS = {
   listMaybePostings: 'postings:maybe',
   setPostingStatus: 'postings:setStatus',
 
+  getUpdateStatus: 'updates:status',
+  checkForUpdates: 'updates:check',
+  installUpdate: 'updates:install',
+
   getProfile: 'profile:get',
   saveProfile: 'profile:save',
   saveAnswer: 'profile:saveAnswer',
@@ -232,5 +257,6 @@ export const CHANNELS = {
 
 export const EVENTS = {
   runFinished: 'checks:finished',
-  runStarted: 'checks:started'
+  runStarted: 'checks:started',
+  updateStatus: 'updates:status-changed'
 } as const

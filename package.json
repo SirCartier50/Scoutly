@@ -26,12 +26,14 @@
     "server:migrate": "wrangler d1 migrations apply career-watch --config server/wrangler.toml --remote",
     "server:migrate:local": "wrangler d1 migrations apply career-watch --config server/wrangler.toml --local",
     "check:scout": "node scripts/run-check.mjs scripts/scout-check.ts",
-    "check:resume": "node scripts/run-check.mjs scripts/resume-check.ts"
+    "check:resume": "node scripts/run-check.mjs scripts/resume-check.ts",
+    "release": "npm run build && electron-builder --win --publish always"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",
     "cheerio": "^1.1.2",
     "docx": "^9.7.1",
+    "electron-updater": "^6.8.9",
     "jose": "^5.10.0",
     "mammoth": "^1.12.3",
     "pdfjs-dist": "^6.3.289",

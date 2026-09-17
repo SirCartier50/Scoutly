@@ -1,8 +1,10 @@
-import { app, BrowserWindow, Notification } from 'electron'
+import { app, BrowserWindow, Notification, ipcMain } from 'electron'
 import { EVENTS } from '@shared/ipc'
 import { initDatabase } from './db/location'
 import { markOpened, registerIpc } from './ipc'
 import { registerResumeIpc } from './resume'
+import { checkForUpdates, getUpdateStatus, initUpdater, installUpdate, stopUpdater } from './updater'
+import { CHANNELS } from '@shared/ipc'
 import { appState } from './state'
 import { createTray, destroyTray } from './tray'
 import { getServerToken, getServerUrl, isConfigured } from './serverClient'
@@ -59,6 +61,10 @@ if (!app.requestSingleInstanceLock()) {
     initDatabase()
     registerIpc()
     registerResumeIpc()
+    ipcMain.handle(CHANNELS.getUpdateStatus, () => getUpdateStatus())
+    ipcMain.handle(CHANNELS.checkForUpdates, () => checkForUpdates())
+    ipcMain.handle(CHANNELS.installUpdate, () => installUpdate())
+    initUpdater()
     createTray(() => void pollForChanges())
 
     const win = createWindow()
@@ -87,6 +93,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('will-quit', () => {
     if (pollTimer) clearInterval(pollTimer)
+    stopUpdater()
     destroyTray()
   })
 }

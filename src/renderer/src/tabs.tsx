@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { JSX } from 'react'
-import type { SeedSuggestion, UiPosting, UiProgram, UiSettings } from '@shared/ipc'
+import type { SeedSuggestion, UiPosting, UiProgram, UiSettings, UpdateStatus } from '@shared/ipc'
 import type { Company } from '@shared/types'
 import {
   Button, Card, Chip, Empty, RoleBadge, TextField, Toggle,
@@ -801,6 +801,8 @@ export function Settings({ onSaved }: { onSaved: () => void }): JSX.Element {
         </p>
       </Card>
 
+      <UpdatesCard />
+
       <Card title="Background behavior">
         <Toggle
           checked={s.launchAtLogin}
@@ -819,5 +821,58 @@ export function Settings({ onSaved }: { onSaved: () => void }): JSX.Element {
         </Card>
       )}
     </div>
+  )
+}
+
+/* ================================================================ updates */
+
+function UpdatesCard(): JSX.Element {
+  const [u, setU] = useState<UpdateStatus | null>(null)
+  const [checking, setChecking] = useState(false)
+
+  useEffect(() => {
+    void window.api.getUpdateStatus().then(setU)
+    return window.api.onUpdateStatus(setU)
+  }, [])
+
+  if (!u) return <Card title="Updates"><Empty title="Loading…" /></Card>
+
+  const check = async (): Promise<void> => {
+    setChecking(true)
+    try {
+      setU(await window.api.checkForUpdates())
+    } finally {
+      setChecking(false)
+    }
+  }
+
+  const line: Record<UpdateStatus['state'], string> = {
+    disabled: u.reason ?? 'Automatic updates are off.',
+    idle: 'Checks for updates automatically.',
+    checking: 'Checking for updates…',
+    'up-to-date': 'You have the latest version.',
+    downloading: `Downloading ${u.availableVersion ?? 'update'}${u.progress !== undefined ? ` - ${u.progress}%` : ''}…`,
+    ready: `${u.availableVersion} is ready - restart to finish updating.`,
+    error: u.error ?? 'Update check failed.'
+  }
+
+  return (
+    <Card title="Updates">
+      <p className="text-sm">Version {u.currentVersion}</p>
+      <p className={`mt-1 text-xs ${u.state === 'error' ? 'text-danger' : 'text-on-surface-variant'}`}>{line[u.state]}</p>
+      <div className="mt-3 flex gap-2">
+        {u.state === 'ready' ? (
+          <Button onClick={() => void window.api.installUpdate()}>Restart to update</Button>
+        ) : (
+          <Button
+            variant="tonal"
+            onClick={() => void check()}
+            disabled={checking || u.state === 'disabled' || u.state === 'checking' || u.state === 'downloading'}
+          >
+            {checking ? 'Checking…' : 'Check for updates'}
+          </Button>
+        )}
+      </div>
+    </Card>
   )
 }

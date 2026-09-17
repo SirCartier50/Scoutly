@@ -27,3 +27,12 @@ nsis:
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
+# Where the app's auto-updater (src/main/updater.ts) looks for new versions,
+# and where `npm run release` publishes them. Each published release carries
+# latest.yml next to the installer - that file is what an installed copy
+# compares its own version against.
+publish:
+  provider: github
+  owner: SirCartier50
+  repo: Scoutly
+  releaseType: release

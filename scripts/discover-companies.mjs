@@ -20,133 +20,19 @@
  * Output is a SQL migration for review - this never writes to D1 directly.
  */
 import { writeFileSync } from 'node:fs'
+import { UA, inferFromUrl, slugify, verify, withConcurrency } from './lib/ats.mjs'
 
 const SOURCES = [
   'https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json',
   'https://raw.githubusercontent.com/SimplifyJobs/New-Grad-Positions/dev/.github/scripts/listings.json'
 ]
 
-const UA = 'career-watch-discovery/0.1 (+bulk company onboarding, verifies every candidate live before trusting it)'
 
 const args = process.argv.slice(2)
 const limitIdx = args.indexOf('--limit')
 const LIMIT = limitIdx >= 0 ? Number(args[limitIdx + 1]) : Infinity
 const outIdx = args.indexOf('--out')
 const OUT = outIdx >= 0 ? args[outIdx + 1] : 'server/migrations/0010_discovered_companies.sql'
-
-function slugify(name) {
-  return name.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
-}
-
-/**
- * Infers a candidate (ats_type, token/config, and a clean careers_url that
- * points at the company's general board rather than the one specific job
- * posting the source dataset happened to link) purely from the apply URL's
- * shape - a hint, not yet trusted.
- */
-function inferFromUrl(url) {
-  let m
-  if ((m = /(?:job-boards|boards)\.greenhouse\.io\/([a-z0-9_-]+)/i.exec(url)))
-    return { ats: 'greenhouse', token: m[1], careersUrl: `https://job-boards.greenhouse.io/${m[1]}` }
-  if ((m = /boards-api\.greenhouse\.io\/v1\/boards\/([a-z0-9_-]+)/i.exec(url)))
-    return { ats: 'greenhouse', token: m[1], careersUrl: `https://job-boards.greenhouse.io/${m[1]}` }
-  if ((m = /jobs\.lever\.co\/([a-z0-9_.-]+)/i.exec(url)))
-    return { ats: 'lever', token: m[1], careersUrl: `https://jobs.lever.co/${m[1]}` }
-  if ((m = /jobs\.ashbyhq\.com\/([a-z0-9_.-]+)/i.exec(url)))
-    return { ats: 'ashby', token: m[1], careersUrl: `https://jobs.ashbyhq.com/${m[1]}` }
-  if ((m = /jobs\.smartrecruiters\.com\/([a-zA-Z0-9_-]+)\//i.exec(url)))
-    return { ats: 'smartrecruiters', token: m[1], careersUrl: `https://jobs.smartrecruiters.com/${m[1]}` }
-  if ((m = /careers\.smartrecruiters\.com\/([a-zA-Z0-9_-]+)/i.exec(url)))
-    return { ats: 'smartrecruiters', token: m[1], careersUrl: `https://careers.smartrecruiters.com/${m[1]}` }
-  if ((m = /https?:\/\/([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com\/(?:[a-z]{2}-[A-Z]{2}\/)?([a-z0-9_-]+)\//i.exec(url))) {
-    const [, tenant, wdN, site] = m
-    return {
-      ats: 'workday',
-      endpoint: `https://${tenant}.${wdN}.myworkdayjobs.com/wday/cxs/${tenant}/${site}/jobs`,
-      careersUrl: `https://${tenant}.${wdN}.myworkdayjobs.com/${site}`
-    }
-  }
-  if ((m = /([a-z0-9.-]+\.oraclecloud\.com)\/hcmUI\/CandidateExperience\/en\/sites\/([^/]+)\//i.exec(url))) {
-    const [, host, siteName] = m
-    // The URL's own /sites/<X>/ segment IS the siteNumber in the common case
-    // (Uber, whose siteNumber and siteName differ, is the exception, not the
-    // rule) - verification below is what catches it when this guess is wrong.
-    return {
-      ats: 'oraclehcm',
-      token: `${host}|${siteName}|${siteName}`,
-      careersUrl: `https://${host}/hcmUI/CandidateExperience/en/sites/${siteName}/requisitions`
-    }
-  }
-  return null
-}
-
-/** Re-derives the real thing by calling the company's own public API - never trusts the URL-shape hint alone. */
-async function verify(candidate) {
-  try {
-    if (candidate.ats === 'greenhouse') {
-      const r = await fetch(`https://boards-api.greenhouse.io/v1/boards/${candidate.token}/jobs`, { headers: { 'user-agent': UA } })
-      if (!r.ok) return null
-      const j = await r.json()
-      return Array.isArray(j.jobs) && j.jobs.length > 0 ? { ats_type: 'greenhouse', board_token: candidate.token, count: j.jobs.length } : null
-    }
-    if (candidate.ats === 'lever') {
-      const r = await fetch(`https://api.lever.co/v0/postings/${candidate.token}?mode=json`, { headers: { 'user-agent': UA } })
-      if (!r.ok) return null
-      const j = await r.json()
-      return Array.isArray(j) && j.length > 0 ? { ats_type: 'lever', board_token: candidate.token, count: j.length } : null
-    }
-    if (candidate.ats === 'ashby') {
-      const r = await fetch(`https://api.ashbyhq.com/posting-api/job-board/${candidate.token}`, { headers: { 'user-agent': UA } })
-      if (!r.ok) return null
-      const j = await r.json()
-      return Array.isArray(j.jobs) && j.jobs.length > 0 ? { ats_type: 'ashby', board_token: candidate.token, count: j.jobs.length } : null
-    }
-    if (candidate.ats === 'smartrecruiters') {
-      const r = await fetch(`https://api.smartrecruiters.com/v1/companies/${candidate.token}/postings?limit=5`, { headers: { 'user-agent': UA } })
-      if (!r.ok) return null
-      const j = await r.json()
-      return (j.totalFound ?? 0) > 0 ? { ats_type: 'smartrecruiters', board_token: candidate.token, count: j.totalFound } : null
-    }
-    if (candidate.ats === 'workday') {
-      const r = await fetch(candidate.endpoint, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'user-agent': UA },
-        body: JSON.stringify({ appliedFacets: {}, limit: 5, offset: 0, searchText: '' })
-      })
-      if (!r.ok) return null
-      const j = await r.json()
-      return (j.total ?? 0) > 0 ? { ats_type: 'workday', parse_config: { kind: 'json-endpoint', url: candidate.endpoint }, count: j.total } : null
-    }
-    if (candidate.ats === 'oraclehcm') {
-      const [host, siteNumber] = candidate.token.split('|')
-      const finder = `findReqs;siteNumber=${encodeURIComponent(siteNumber)},limit=5,offset=0,sortBy=POSTING_DATES_DESC`
-      const r = await fetch(
-        `https://${host}/hcmRestApi/resources/latest/recruitingCEJobRequisitions?onlyData=true&expand=requisitionList&finder=${encodeURIComponent(finder)}`,
-        { headers: { 'user-agent': UA, accept: 'application/json' } }
-      )
-      if (!r.ok) return null
-      const j = await r.json()
-      const count = j.items?.[0]?.TotalJobsCount ?? 0
-      return count > 0 ? { ats_type: 'oraclehcm', board_token: candidate.token, count } : null
-    }
-  } catch {
-    return null
-  }
-  return null
-}
-
-async function withConcurrency(items, limit, fn) {
-  const results = []
-  let i = 0
-  async function worker() {
-    while (i < items.length) {
-      const idx = i++
-      results[idx] = await fn(items[idx])
-    }
-  }
-  await Promise.all(Array.from({ length: limit }, worker))
-  return results
-}
 
 async function main() {
   console.log('Fetching source datasets (discovery only - not stored)...')
