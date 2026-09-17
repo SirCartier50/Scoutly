@@ -41,6 +41,8 @@ export interface UiSettings {
   wantNewGrad: boolean
   wantProgram: boolean
   functions: string[]
+  includeKeywords: string[]
+  excludeKeywords: string[]
   degreeLevel: string | null
   scheduleTimes: string[]
   gmailAddress: string | null
@@ -49,6 +51,66 @@ export interface UiSettings {
   hasGmailPassword: boolean
   hasApiKey: boolean
   encryptionAvailable: boolean
+}
+
+/* ------------------------------------------------- resume + profile (local) */
+
+/** Answers to the long tail of application questions, reused across applications. */
+export interface SavedAnswer {
+  question: string
+  answer: string
+  updatedAt: string
+}
+
+export interface UiProfile {
+  /** Keyed by the field names in main/db/profile.ts's PROFILE_FIELDS. */
+  fields: Record<string, string>
+  answers: SavedAnswer[]
+  llmBaseUrl: string
+  llmModel: string
+  /** The key itself never crosses this boundary - only whether one is set. */
+  hasLlmKey: boolean
+}
+
+export interface UiResume {
+  id: number
+  label: string
+  kind: string
+  isDefault: boolean
+  createdAt: string
+  textLength: number
+}
+
+export interface UiTailored {
+  id: number
+  resumeId: number
+  postingId: number | null
+  companyName: string
+  jobTitle: string
+  jobUrl: string | null
+  markdown: string
+  /** What the model changed, and what the job wants that the resume lacks. */
+  changes: string[]
+  gaps: string[]
+  pdfPath: string | null
+  docxPath: string | null
+  createdAt: string
+}
+
+export interface TailorRequest {
+  postingId?: number | null
+  companyName: string
+  jobTitle: string
+  jobUrl?: string | null
+  jobDescription: string
+  /** Defaults to the resume marked default. */
+  resumeId?: number | null
+}
+
+export interface TailorSummary {
+  ok: boolean
+  tailored?: UiTailored
+  error?: string
 }
 
 export interface SeedSuggestion {
@@ -84,6 +146,10 @@ export interface IpcApi {
     search?: string
     companyId?: number
     includeClosed?: boolean
+    /** Applied on this machine - see main/ipc.ts. Empty/omitted means no filter. */
+    functions?: string[]
+    includeKeywords?: string[]
+    excludeKeywords?: string[]
   }): Promise<UiPosting[]>
   listNewSinceLastOpen(): Promise<UiPosting[]>
   listPrograms(): Promise<UiProgram[]>
@@ -98,6 +164,25 @@ export interface IpcApi {
   testServerConnection(): Promise<{ ok: boolean; error?: string }>
   listMaybePostings(): Promise<UiPosting[]>
   setPostingStatus(id: number, status: string, note?: string): Promise<void>
+
+  getProfile(): Promise<UiProfile>
+  saveProfile(patch: Record<string, string>): Promise<void>
+  saveAnswer(question: string, answer: string): Promise<void>
+  deleteAnswer(question: string): Promise<void>
+  saveTailorConfig(cfg: { baseUrl?: string; model?: string; apiKey?: string }): Promise<void>
+
+  listResumes(): Promise<UiResume[]>
+  importResume(): Promise<{ ok: boolean; id?: number; error?: string }>
+  setDefaultResume(id: number): Promise<void>
+  deleteResume(id: number): Promise<void>
+
+  listTailored(): Promise<UiTailored[]>
+  tailorResume(req: TailorRequest): Promise<TailorSummary>
+  deleteTailored(id: number): Promise<void>
+  exportTailored(
+    id: number,
+    formats: ('pdf' | 'docx')[]
+  ): Promise<{ ok: boolean; paths?: string[]; error?: string }>
 }
 
 export const CHANNELS = {
@@ -126,7 +211,23 @@ export const CHANNELS = {
   configureServer: 'server:configure',
   testServerConnection: 'server:test',
   listMaybePostings: 'postings:maybe',
-  setPostingStatus: 'postings:setStatus'
+  setPostingStatus: 'postings:setStatus',
+
+  getProfile: 'profile:get',
+  saveProfile: 'profile:save',
+  saveAnswer: 'profile:saveAnswer',
+  deleteAnswer: 'profile:deleteAnswer',
+  saveTailorConfig: 'profile:saveTailorConfig',
+
+  listResumes: 'resumes:list',
+  importResume: 'resumes:import',
+  setDefaultResume: 'resumes:setDefault',
+  deleteResume: 'resumes:delete',
+
+  listTailored: 'tailored:list',
+  tailorResume: 'tailored:create',
+  deleteTailored: 'tailored:delete',
+  exportTailored: 'tailored:export'
 } as const
 
 export const EVENTS = {

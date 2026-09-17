@@ -29,8 +29,10 @@ export interface FetchJob {
 
 /** What Cloudflare actually hands the Worker: secrets and bindings, no database. */
 export interface RawEnv {
-  TURSO_DATABASE_URL: string
-  TURSO_AUTH_TOKEN: string
+  /** D1 binding. Used whenever it's bound - see withDb. */
+  DB?: D1Database
+  TURSO_DATABASE_URL?: string
+  TURSO_AUTH_TOKEN?: string
   RESEND_API_KEY?: string
   LLM_API_KEY?: string
   LLM_BASE_URL?: string
@@ -42,17 +44,25 @@ export interface RawEnv {
 }
 
 /** RawEnv plus the connected database - what everything downstream expects. */
-export interface Env extends RawEnv {
+export interface Env extends Omit<RawEnv, 'DB'> {
   DB: Db
 }
 
 /**
- * Turso is reached over HTTP rather than bound by the runtime, so unlike a D1
- * binding the connection has to be built per invocation. Every entry point
- * (fetch/scheduled/queue) calls this once and passes the result down, which is
- * why nothing below here had to change when the engine swapped.
+ * Picks the storage engine per invocation. A D1 binding wins when present -
+ * D1 already satisfies the narrow Db surface natively - otherwise Turso,
+ * which is reached over HTTP and has to be connected per invocation.
+ *
+ * Supporting both means the Turso cutover is a config change, not a code
+ * change: create the Turso DB, copy the data, set the two secrets, then drop
+ * the [[d1_databases]] block from wrangler.toml and redeploy. Until then,
+ * server fixes can still ship on D1 instead of waiting on that migration.
  */
 export function withDb(env: RawEnv): Env {
+  if (env.DB) return { ...env, DB: env.DB as unknown as Db }
+  if (!env.TURSO_DATABASE_URL || !env.TURSO_AUTH_TOKEN) {
+    throw new Error('no database configured: bind D1 as DB, or set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN')
+  }
   return { ...env, DB: createDb(env.TURSO_DATABASE_URL, env.TURSO_AUTH_TOKEN) }
 }
 

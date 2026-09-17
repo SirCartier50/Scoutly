@@ -41,6 +41,22 @@ const api: IpcApi & {
   listMaybePostings: () => call(CHANNELS.listMaybePostings),
   setPostingStatus: (id, status, note) => call(CHANNELS.setPostingStatus, id, status, note),
 
+  getProfile: () => call(CHANNELS.getProfile),
+  saveProfile: (patch) => call(CHANNELS.saveProfile, patch),
+  saveAnswer: (question, answer) => call(CHANNELS.saveAnswer, question, answer),
+  deleteAnswer: (question) => call(CHANNELS.deleteAnswer, question),
+  saveTailorConfig: (cfg) => call(CHANNELS.saveTailorConfig, cfg),
+
+  listResumes: () => call(CHANNELS.listResumes),
+  importResume: () => call(CHANNELS.importResume),
+  setDefaultResume: (id) => call(CHANNELS.setDefaultResume, id),
+  deleteResume: (id) => call(CHANNELS.deleteResume, id),
+
+  listTailored: () => call(CHANNELS.listTailored),
+  tailorResume: (req) => call(CHANNELS.tailorResume, req),
+  deleteTailored: (id) => call(CHANNELS.deleteTailored, id),
+  exportTailored: (id, formats) => call(CHANNELS.exportTailored, id, formats),
+
   onRunFinished(cb) {
     const l = (): void => cb()
     ipcRenderer.on(EVENTS.runFinished, l)

@@ -23,7 +23,11 @@ execFileSync(
   process.execPath,
   [require.resolve('esbuild/bin/esbuild'), entry, '--bundle', '--platform=node',
    '--format=esm', '--target=node22', '--alias:@shared=./src/shared',
+   // Externalised for the same reason electron-vite externalises them in the
+   // real build: these are CommonJS packages whose internal require() calls
+   // break once bundled into a single ESM file.
    '--external:node:sqlite', '--external:electron', '--external:cheerio',
+   '--external:mammoth', '--external:pdfjs-dist', '--external:docx',
    `--outfile=${out}`, '--log-level=warning'],
   { stdio: 'inherit' }
 )

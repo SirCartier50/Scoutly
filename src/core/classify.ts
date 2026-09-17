@@ -381,6 +381,26 @@ export function functionAllowed(
   return wantedFunctions.includes(fn)
 }
 
+/**
+ * The user's own title keywords - the precise override for whatever the
+ * function classifier gets wrong. Exclude wins over include; an empty include
+ * list means "no requirement". Matched on word-ish boundaries so "ai" doesn't
+ * hit "maintenance", but written by hand rather than `\b` so keywords like
+ * "c++" or ".net" still work.
+ */
+export function keywordsAllowed(title: string, include: string[] = [], exclude: string[] = []): boolean {
+  const t = title.toLowerCase()
+  const has = (keyword: string): boolean => {
+    const k = keyword.trim().toLowerCase()
+    if (!k) return false
+    const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    return new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`).test(t)
+  }
+  if (exclude.some(has)) return false
+  const wanted = include.filter((k) => k.trim())
+  return wanted.length === 0 || wanted.some(has)
+}
+
 /** The ambiguous band, kept separate so the user can review rather than trust. */
 export function maybePostings(
   postings: ClassifiedPosting[],

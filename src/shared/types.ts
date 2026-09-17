@@ -7,6 +7,10 @@ export type AtsType =
   | 'smartrecruiters'
   | 'workday'
   | 'oraclehcm'
+  /** Eightfold AI talent sites (e.g. Netflix) - search-only, 10 per page. */
+  | 'eightfold'
+  /** m-cloud.io hosted jobs API behind the "CWS" WordPress careers plugin (e.g. Victoria's Secret). */
+  | 'mcloud'
   | 'careerpage'
   // Dedicated connectors for specific large employers whose custom in-house
   // systems have a real, reverse-engineered JSON endpoint. Unlike the generic

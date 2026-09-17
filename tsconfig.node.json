@@ -34,6 +34,7 @@
     "src/preload/**/*",
     "src/shared/**/*",
     "electron.vite.config.ts",
-    "scripts/**/*"
+    "scripts/**/*",
+    "server/src/db.ts"
   ]
 }

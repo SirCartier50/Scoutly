@@ -6,6 +6,8 @@ import type { AppStatus } from '@shared/types'
 import { api, getServerToken, getServerUrl, isConfigured, setServerConfig, testConnection, ServerError } from './serverClient'
 import { getSettings as getLocalSettings, setSetting as setLocalSetting } from './db/settings'
 import { getDb } from './db/index'
+import { functionAllowed, keywordsAllowed, type JobFunction } from '../core/classify'
+import type { RoleType } from '@shared/types'
 
 /**
  * Every handler here is a thin proxy to the server - the desktop app owns no
@@ -145,7 +147,11 @@ export function registerIpc(): void {
     return rows.map((c) => ({
       id: c.id, name: c.name, careersUrl: c.careers_url, atsType: c.ats_type as never,
       boardToken: c.board_token, topics: JSON.parse(c.topics) as string[],
-      watched: c.watched === 1, source: 'manual' as const,
+      // Multi-tenant: every user gets every company, so there's no per-user
+      // watched flag to read. Reading the old column made every company look
+      // unwatched - which emptied the Postings company filter and flipped the
+      // Dashboard to "Pick companies to watch".
+      watched: true, source: 'manual' as const,
       lastOkAt: c.last_ok_at, lastYield: c.last_yield, health: c.health as never
     }))
   })
@@ -247,17 +253,40 @@ export function registerIpc(): void {
 
   handle(
     CHANNELS.listPostings,
-    async (q: { roleTypes?: string[]; search?: string; companyId?: number; includeClosed?: boolean }) => {
+    async (q: {
+      roleTypes?: string[]
+      search?: string
+      companyId?: number
+      includeClosed?: boolean
+      functions?: string[]
+      includeKeywords?: string[]
+      excludeKeywords?: string[]
+    }) => {
       if (!isConfigured()) return []
       const params = new URLSearchParams()
       if (q?.roleTypes?.length) params.set('roleTypes', q.roleTypes.join(','))
       if (q?.search) params.set('search', q.search)
-      // Filtered and ranked server-side now (relevance when searching, most
-      // recent otherwise) rather than fetched-then-filtered here, so the
-      // 500-row cap can't silently drop a company's postings before this
-      // ever sees them.
+      // Role, company and search are filtered and ranked server-side
+      // (relevance when searching, most recent otherwise), so the 500-row cap
+      // can't silently drop a company's postings before this ever sees them.
       if (q?.companyId !== undefined) params.set('companyId', String(q.companyId))
-      return await api.get<ServerPosting[]>(`/api/postings?${params.toString()}`)
+      const rows = await api.get<ServerPosting[]>(`/api/postings?${params.toString()}`)
+
+      // Function and keyword filtering run HERE, with the same classifier the
+      // server uses, rather than trusting the server to have done it. That
+      // keeps the filter working against any Worker version - including one
+      // deployed before these filters existed - and makes it instant to
+      // change, with no round trip to save settings first.
+      const functions = (q?.functions ?? []) as JobFunction[]
+      const include = q?.includeKeywords ?? []
+      const exclude = q?.excludeKeywords ?? []
+      if (functions.length === 0 && include.length === 0 && exclude.length === 0) return rows
+
+      return rows.filter(
+        (p) =>
+          functionAllowed(p.title, p.roleType as RoleType, functions, p.description) &&
+          keywordsAllowed(p.title, include, exclude)
+      )
     }
   )
 
@@ -295,6 +324,7 @@ export function registerIpc(): void {
     const server: Record<string, unknown> = configured
       ? await api.get<Record<string, unknown>>('/api/settings').catch(() => ({}))
       : {}
+    const local = getLocalSettings(getDb())
 
     return {
       locations: (server.locations as string[]) ?? [],
@@ -303,7 +333,11 @@ export function registerIpc(): void {
       wantIntern: (server.wantIntern as boolean) ?? true,
       wantNewGrad: (server.wantNewGrad as boolean) ?? true,
       wantProgram: (server.wantProgram as boolean) ?? true,
-      functions: (server.functions as string[]) ?? ['engineering', 'data'],
+      functions: (server.functions as string[]) ?? local.functions,
+      // Server first (it's what the email uses), local as the fallback for a
+      // Worker that doesn't know these keys yet.
+      includeKeywords: (server.includeKeywords as string[]) ?? local.includeKeywords,
+      excludeKeywords: (server.excludeKeywords as string[]) ?? local.excludeKeywords,
       degreeLevel: (server.degreeLevel as string | null) ?? 'bachelors',
       scheduleTimes: ['hourly'], // the server checks hourly; not user-editable here
       gmailAddress: null,
@@ -321,7 +355,17 @@ export function registerIpc(): void {
     if ('launchAtLogin' in patch) {
       app.setLoginItemSettings({ openAtLogin: patch.launchAtLogin === true, args: ['--hidden'] })
     }
-    const serverKeys = ['locations', 'remoteOk', 'topics', 'wantIntern', 'wantNewGrad', 'wantProgram', 'functions', 'degreeLevel']
+    // Filters are kept locally as well, so they survive a restart even when
+    // the deployed Worker predates a key and drops it on save.
+    const db = getDb()
+    if (patch.functions) setLocalSetting(db, 'functions', patch.functions as JobFunction[])
+    if (patch.includeKeywords) setLocalSetting(db, 'includeKeywords', patch.includeKeywords)
+    if (patch.excludeKeywords) setLocalSetting(db, 'excludeKeywords', patch.excludeKeywords)
+
+    const serverKeys = [
+      'locations', 'remoteOk', 'topics', 'wantIntern', 'wantNewGrad', 'wantProgram',
+      'functions', 'includeKeywords', 'excludeKeywords', 'degreeLevel'
+    ]
     const clean: Record<string, unknown> = {}
     for (const k of serverKeys) if (k in patch) clean[k] = (patch as Record<string, unknown>)[k]
     if (Object.keys(clean).length > 0 && isConfigured()) await api.put('/api/settings', clean)

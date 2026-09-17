@@ -11,12 +11,26 @@ export interface Settings {
   wantProgram: boolean
   /** Empty means every function passes. */
   functions: JobFunction[]
+  /**
+   * Title keywords. Also saved to the server (so the email follows them), but
+   * kept here too: a Worker that predates keyword support silently drops
+   * keys it doesn't recognise, and the filter shouldn't reset on restart.
+   */
+  includeKeywords: string[]
+  excludeKeywords: string[]
   /** Highest degree held or being pursued; null disables the filter. */
   degreeLevel: DegreeLevel | null
   scheduleTimes: string[]
   gmailAddress: string | null
   monthlyCapUsd: number
   models: { scout: string; scoutEscalation: string; triage: string; medic: string }
+  /**
+   * Resume tailoring runs on the user's OWN model key, on this machine - see
+   * main/resume.ts. Any OpenAI-compatible endpoint works; Groq's free tier is
+   * the default so tailoring costs nothing out of the box.
+   */
+  llmBaseUrl: string
+  llmModel: string
   lastSuccessfulRun: string | null
   lastOpenedAt: string | null
   onboarded: boolean
@@ -31,6 +45,8 @@ export const DEFAULT_SETTINGS: Settings = {
   wantNewGrad: true,
   wantProgram: true,
   functions: ['engineering', 'data'],
+  includeKeywords: [],
+  excludeKeywords: [],
   degreeLevel: 'bachelors',
   scheduleTimes: ['09:00', '18:00'],
   gmailAddress: null,
@@ -41,6 +57,8 @@ export const DEFAULT_SETTINGS: Settings = {
     triage: 'claude-haiku-4-5',
     medic: 'claude-opus-5'
   },
+  llmBaseUrl: 'https://api.groq.com/openai/v1',
+  llmModel: 'llama-3.3-70b-versatile',
   lastSuccessfulRun: null,
   lastOpenedAt: null,
   onboarded: false,

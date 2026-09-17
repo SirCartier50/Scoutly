@@ -10,7 +10,13 @@ import { dirname, join } from 'node:path'
  * app password plus an API key should not ride along with it.
  */
 
-export type SecretKey = 'gmailAppPassword' | 'anthropicApiKey' | 'serverUrl' | 'serverToken'
+export type SecretKey =
+  | 'gmailAppPassword'
+  | 'anthropicApiKey'
+  /** The user's own model key, used for on-device resume tailoring. */
+  | 'llmApiKey'
+  | 'serverUrl'
+  | 'serverToken'
 
 interface SecretFile {
   /** base64 ciphertext per key, or plaintext when encryption is unavailable. */

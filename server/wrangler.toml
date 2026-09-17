@@ -4,14 +4,19 @@ compatibility_date = "2026-08-01"
 # nodejs_compat gives us URL, TextDecoder and friends that the shared core uses.
 compatibility_flags = ["nodejs_compat"]
 
-# No database binding: storage moved off D1 to Turso (libSQL), which is
-# reached over HTTP with a URL + token rather than bound by the runtime - see
-# server/src/db.ts for the adapter and the reasoning. D1's Free plan capped
-# writes at 100K rows/day and rejected EVERY query account-wide once hit
-# (which took sign-in down with it); Turso's free plan allows 10M rows
-# written per month. Still SQLite underneath, so no SQL changed.
+# Storage: D1 while this block is present, Turso once it's removed (see
+# withDb in server/src/d1.ts - it uses the D1 binding whenever one is bound).
 #
-# TURSO_DATABASE_URL / TURSO_AUTH_TOKEN are set as secrets (below).
+# Turso is the planned destination: D1's Free plan caps writes at 100K
+# rows/day and rejects EVERY query account-wide once hit (which took sign-in
+# down with it); Turso's free plan allows 10M rows written per month, and it's
+# SQLite underneath, so no SQL changes. Cutover: create the Turso DB, copy the
+# data, set TURSO_DATABASE_URL / TURSO_AUTH_TOKEN as secrets (below), then
+# delete this block and redeploy. Kept on D1 until then so fixes can still ship.
+[[d1_databases]]
+binding = "DB"
+database_name = "career-watch"
+database_id = "41baea19-f7ec-4180-8246-4a485ed57390"
 
 # Real Chromium, used ONLY for one-off discovery of hard custom career sites
 # (e.g. Google's SPA has zero job data in its raw HTML - it only exists after
