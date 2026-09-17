@@ -1,7 +1,7 @@
 import { registerWorkerHtmlParser } from './htmlParser'
 import { enqueueFetchJobs, fetchAndStoreCompany, runNotifyPass, DEFAULT_USER_SETTINGS } from './check'
 import { verifyGoogleIdToken } from './auth'
-import { functionAllowed } from '../../src/core/classify'
+import { functionAllowed, keywordsAllowed } from '../../src/core/classify'
 import type { RoleType } from '../../src/shared/types'
 import {
   authenticateToken, getUserSettings, issueToken, listAllCompanies,
@@ -181,7 +181,11 @@ async function handleApi(req: Request, env: Env, url: URL, user: UserRow): Promi
     const settings = await getUserSettings(db, userId, DEFAULT_USER_SETTINGS)
     const filtered = allFunctions
       ? (results ?? [])
-      : (results ?? []).filter((p) => functionAllowed(p.title, p.roleType, settings.functions, p.description))
+      : (results ?? []).filter(
+          (p) =>
+            functionAllowed(p.title, p.roleType, settings.functions, p.description) &&
+            keywordsAllowed(p.title, settings.includeKeywords, settings.excludeKeywords)
+        )
     return json(filtered.slice(0, 500))
   }
 

@@ -2,11 +2,12 @@ import { useCallback, useEffect, useState } from 'react'
 import type { JSX } from 'react'
 import type { AppStatus } from '@shared/types'
 import { Companies, Dashboard, Postings, Programs, Settings } from './tabs'
+import { Resume } from './resume'
 
 // No Admin tab: watcher health and "Check now" are operator concerns, not
 // something a job seeker using the app needs (and Check now spends the
 // shared free-tier budget for every user).
-const TABS = ['Dashboard', 'Postings', 'Programs', 'Companies', 'Settings'] as const
+const TABS = ['Dashboard', 'Postings', 'Programs', 'Resume', 'Companies', 'Settings'] as const
 type Tab = (typeof TABS)[number]
 
 export default function App(): JSX.Element {
@@ -85,6 +86,7 @@ export default function App(): JSX.Element {
         {tab === 'Dashboard' && <Dashboard onGoto={(t) => setTab(t as Tab)} />}
         {tab === 'Postings' && <Postings />}
         {tab === 'Programs' && <Programs />}
+        {tab === 'Resume' && <Resume />}
         {tab === 'Companies' && <Companies onChanged={() => void refresh()} />}
         {tab === 'Settings' && <Settings onSaved={() => void refresh()} />}
       </main>

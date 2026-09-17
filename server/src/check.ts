@@ -1,5 +1,5 @@
 import { fetchCompany } from '../../src/core/connectors/index'
-import { classify, classifyPosting, matchesLocation, functionAllowed, degreeRequirement, degreeAllowed } from '../../src/core/classify'
+import { classify, classifyPosting, matchesLocation, functionAllowed, degreeRequirement, degreeAllowed, keywordsAllowed } from '../../src/core/classify'
 import type { DegreeLevel, JobFunction } from '../../src/core/classify'
 import { runScout } from '../../src/core/agents/scout'
 import type { AtsType, RoleType } from '../../src/shared/types'
@@ -55,6 +55,10 @@ export interface UserSettings extends Record<string, unknown> {
   wantNewGrad: boolean
   wantProgram: boolean
   functions: JobFunction[]
+  /** A title must contain at least one of these (when any are set). */
+  includeKeywords: string[]
+  /** A title containing any of these is dropped, whatever else matches. */
+  excludeKeywords: string[]
   degreeLevel: DegreeLevel | null
   digestEmail: string | null
   /**
@@ -77,6 +81,8 @@ export const DEFAULT_USER_SETTINGS: UserSettings = {
   wantNewGrad: true,
   wantProgram: true,
   functions: ['engineering', 'data'],
+  includeKeywords: [],
+  excludeKeywords: [],
   degreeLevel: 'bachelors',
   digestEmail: null,
   maxPostingAgeDays: 90
@@ -334,6 +340,7 @@ export async function runNotifyPass(env: Env, kind = 'scheduled'): Promise<RunSu
       if (!wantedRoles.has(p.roleType)) return false
       if (!matchesLocation(p.location, settings.locations, settings.remoteOk)) return false
       if (!functionAllowed(p.title, p.roleType, settings.functions, p.description)) return false
+      if (!keywordsAllowed(p.title, settings.includeKeywords, settings.excludeKeywords)) return false
       if (!degreeAllowed(degreeRequirement(p.title, p.description), settings.degreeLevel)) return false
       return true
     })

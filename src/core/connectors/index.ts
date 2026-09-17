@@ -1,6 +1,7 @@
 import type { ConnectorTarget, FetchOutcome, ParseConfig, RawPosting } from '@shared/connector'
 import type { AtsType } from '@shared/types'
 import { HttpError, absoluteUrl, getJson, getText, htmlToText, httpGet } from '../http'
+import { classify } from '../classify'
 
 /**
  * Every connector returns the company's FULL open list. Filtering happens in
@@ -832,8 +833,157 @@ export const applejobs: Connector = {
 
 /* ------------------------------------------------------------------ dispatch */
 
+/* ------------------------------------------ search-only APIs: shared budget */
+
+/**
+ * Eightfold and m-cloud can't list a whole board cheaply: they're search APIs,
+ * and Eightfold caps pages at 10. Paging all ~480 of Netflix's jobs would take
+ * ~48 requests - on its own nearly the Worker free plan's 50-subrequests-per-
+ * invocation ceiling, which a queue consumer shares across its whole batch.
+ *
+ * So these query the early-career vocabulary instead and dedupe the results.
+ * That can't miss anything the classifier would have kept: a title with none
+ * of these words classifies as "other" and gets dropped regardless.
+ */
+const EARLY_CAREER_QUERIES = ['intern', 'new grad', 'university graduate', 'early career', 'fellowship', 'apprentice']
+
+/** Descriptions cost one request each on Eightfold; bounded for the same budget reason. */
+const MAX_DESCRIPTIONS = 10
+
+const epochToIso = (seconds: unknown): string | null =>
+  typeof seconds === 'number' && seconds > 0 ? new Date(seconds * 1000).toISOString() : null
+
+/** "Los Gatos,California,United States" -> "Los Gatos, California, United States" */
+const tidyLocation = (raw: string | null | undefined): string | null =>
+  str(raw?.split(',').map((part) => part.trim()).filter(Boolean).join(', '))
+
+/* ----------------------------------------------------------------- eightfold */
+
+interface EightfoldPosition {
+  id: number
+  name?: string
+  posting_name?: string
+  location?: string
+  locations?: string[]
+  department?: string
+  t_create?: number
+  canonicalPositionUrl?: string
+  job_description?: string
+}
+
+/**
+ * boardToken is the company's Eightfold domain (e.g. "netflix.com");
+ * careersUrl is its Eightfold site (e.g. https://explore.jobs.netflix.net),
+ * whose origin hosts the API.
+ */
+export const eightfold: Connector = {
+  type: 'eightfold',
+  async fetch(t) {
+    const domain = t.boardToken
+    if (!domain) throw new HttpError('eightfold connector requires the company domain as its board token', null, false)
+    const origin = new URL(t.careersUrl).origin
+    const api = `${origin}/api/apply/v2/jobs`
+    const PAGE = 10
+
+    const seen = new Map<number, EightfoldPosition>()
+    for (const query of EARLY_CAREER_QUERIES) {
+      for (let page = 0; page < 3; page++) {
+        const res = await getJson<{ positions?: EightfoldPosition[]; count?: number }>(
+          `${api}?domain=${encodeURIComponent(domain)}&query=${encodeURIComponent(query)}&start=${page * PAGE}&num=${PAGE}`
+        )
+        const batch = res.positions ?? []
+        for (const p of batch) if (!seen.has(p.id)) seen.set(p.id, p)
+        if (batch.length < PAGE || (res.count ?? 0) <= (page + 1) * PAGE) break
+      }
+    }
+
+    // The list endpoint omits descriptions. Fetch them only for titles the
+    // classifier already calls early-career - those are what get stored, and
+    // what the resume tailoring needs a description to work from.
+    let described = 0
+    const out: RawPosting[] = []
+    for (const p of seen.values()) {
+      const title = str(p.posting_name) ?? str(p.name) ?? '(untitled)'
+      let description: string | null = null
+      if (described < MAX_DESCRIPTIONS && classify(title).roleType !== 'other') {
+        described++
+        try {
+          const detail = await getJson<EightfoldPosition>(`${api}/${p.id}?domain=${encodeURIComponent(domain)}`)
+          description = detail.job_description ? htmlToText(detail.job_description) : null
+        } catch {
+          // A missing description isn't worth losing the posting over.
+        }
+      }
+      out.push({
+        externalId: String(p.id),
+        title,
+        location: tidyLocation(p.locations?.[0] ?? p.location),
+        applyUrl: p.canonicalPositionUrl ?? `${origin}/careers/job/${p.id}`,
+        postedAt: epochToIso(p.t_create),
+        description,
+        department: str(p.department)
+      })
+    }
+    return out
+  }
+}
+
+/* -------------------------------------------------------------------- mcloud */
+
+interface MCloudJob {
+  id: number
+  title?: string
+  primary_city?: string
+  primary_state?: string
+  primary_country?: string
+  url?: string
+  open_date?: string
+  description?: string
+  department?: string
+  primary_category?: string
+}
+
+/**
+ * boardToken is the m-cloud organisation id (the UUID after "companies/" in
+ * the careers site's `org_id`). Unlike Eightfold the search response already
+ * carries full descriptions, and PageSize is honoured, so one large page per
+ * query is enough - the search is relevance-ranked, fuzzy, and cheap to
+ * over-fetch from since the classifier discards the noise.
+ */
+export const mcloud: Connector = {
+  type: 'mcloud',
+  async fetch(t) {
+    const org = t.boardToken
+    if (!org) throw new HttpError('mcloud connector requires the organisation id as its board token', null, false)
+
+    const seen = new Map<number, MCloudJob>()
+    for (const query of ['internship', 'new graduate']) {
+      const res = await getJson<{ searchResults?: { job?: MCloudJob }[] }>(
+        `https://jobsapi-google.m-cloud.io/api/job/search?CompanyName=${encodeURIComponent(`companies/${org}`)}` +
+          `&Keyword=${encodeURIComponent(query)}&Offset=0&PageSize=100`
+      )
+      for (const r of res.searchResults ?? []) {
+        const job = r.job
+        if (job?.id && !seen.has(job.id)) seen.set(job.id, job)
+      }
+    }
+
+    return [...seen.values()].map((j) => ({
+      externalId: String(j.id),
+      title: str(j.title) ?? '(untitled)',
+      location: str([j.primary_city, j.primary_state].filter(Boolean).join(', ')) ?? str(j.primary_country),
+      applyUrl: j.url ?? t.careersUrl,
+      postedAt: str(j.open_date),
+      description: j.description ? htmlToText(j.description) : null,
+      department: str(j.department) ?? str(j.primary_category)
+    }))
+  }
+}
+
 const REGISTRY: Partial<Record<AtsType, Connector>> = {
   greenhouse,
+  eightfold,
+  mcloud,
   lever,
   ashby,
   smartrecruiters,

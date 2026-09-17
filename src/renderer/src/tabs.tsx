@@ -159,6 +159,19 @@ const ROLE_FILTERS = [
   { key: 'newgrad', label: 'New Grad' }
 ]
 
+/** Ids match src/core/classify.ts's JobFunction; `engineering` means software. */
+const FUNCTION_FILTERS = [
+  { key: 'engineering', label: 'Software' },
+  { key: 'data', label: 'Data / ML' },
+  { key: 'hardware', label: 'Hardware' },
+  { key: 'product', label: 'Product' },
+  { key: 'design', label: 'Design' },
+  { key: 'business', label: 'Business' }
+]
+
+const splitKeywords = (text: string): string[] =>
+  text.split(',').map((s) => s.trim()).filter(Boolean)
+
 const APP_STATUSES = [
   { key: 'none', label: 'Not tracked' },
   { key: 'interested', label: 'Interested' },
@@ -176,26 +189,60 @@ export function Postings(): JSX.Element {
   const [showMaybe, setShowMaybe] = useState(false)
   const [rows, setRows] = useState<UiPosting[]>([])
   const [selected, setSelected] = useState<UiPosting | null>(null)
+  const [functions, setFunctions] = useState<string[]>([])
+  const [includeText, setIncludeText] = useState('')
+  const [excludeText, setExcludeText] = useState('')
+  // Filters start from the saved settings; until those arrive, nothing is
+  // saved back - otherwise the empty initial state would overwrite them.
+  const [filtersReady, setFiltersReady] = useState(false)
 
   useEffect(() => {
     void window.api.listCompanies().then((all) => setCompanies(all.filter((c) => c.watched)))
+    void window.api.getSettings().then((s) => {
+      setFunctions(s.functions)
+      setIncludeText(s.includeKeywords.join(', '))
+      setExcludeText(s.excludeKeywords.join(', '))
+      setFiltersReady(true)
+    })
   }, [])
+
+  const includeKeywords = useMemo(() => splitKeywords(includeText), [includeText])
+  const excludeKeywords = useMemo(() => splitKeywords(excludeText), [excludeText])
 
   const load = useCallback(() => {
     // Sorted most-recent-first by default; a search re-ranks by closeness of
     // match (exact/starts-with/title-contains beats company/location, beats
-    // only-the-description matching), both handled server-side now.
+    // only-the-description matching), both handled server-side. Function and
+    // keyword filters are applied locally in main - see listPostings there.
     const fetcher = showMaybe
       ? window.api.listMaybePostings()
       : window.api.listPostings({
           roleTypes: roles,
           search: search || undefined,
-          companyId: companyId === '' ? undefined : companyId
+          companyId: companyId === '' ? undefined : companyId,
+          functions,
+          includeKeywords,
+          excludeKeywords
         })
     void fetcher.then(setRows)
-  }, [roles, search, showMaybe, companyId])
+  }, [roles, search, showMaybe, companyId, functions, includeKeywords, excludeKeywords])
 
-  useEffect(load, [load])
+  useEffect(() => {
+    if (!filtersReady) return
+    // Debounced: typing a keyword shouldn't fire a request per keystroke.
+    const t = setTimeout(load, 300)
+    return () => clearTimeout(t)
+  }, [load, filtersReady])
+
+  // Saved, so the digest email follows the same filters (once the Worker
+  // supports them) and they survive a restart either way.
+  useEffect(() => {
+    if (!filtersReady) return
+    const t = setTimeout(() => {
+      void window.api.saveSettings({ functions, includeKeywords, excludeKeywords })
+    }, 800)
+    return () => clearTimeout(t)
+  }, [functions, includeKeywords, excludeKeywords, filtersReady])
 
   const toggle = (key: string): void =>
     setRoles((r) => (r.includes(key) ? r.filter((x) => x !== key) : [...r, key]))
@@ -239,6 +286,45 @@ export function Postings(): JSX.Element {
             <TextField value={search} onChange={setSearch} placeholder="Search title or company…" />
           </div>
         </div>
+
+        {!showMaybe && (
+          <div className="mb-4 grid gap-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-on-surface-variant">Function</span>
+              {FUNCTION_FILTERS.map((f) => {
+                const active = functions.includes(f.key)
+                return (
+                  <Chip
+                    key={f.key}
+                    selected={active}
+                    onClick={() =>
+                      setFunctions((cur) => (active ? cur.filter((x) => x !== f.key) : [...cur, f.key]))
+                    }
+                  >
+                    {f.label}
+                  </Chip>
+                )
+              })}
+              {functions.length === 0 && (
+                <span className="text-xs text-on-surface-variant">none selected = all functions</span>
+              )}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <TextField
+                label="Title must contain one of"
+                value={includeText}
+                onChange={setIncludeText}
+                placeholder="software, swe, developer"
+              />
+              <TextField
+                label="Hide titles containing"
+                value={excludeText}
+                onChange={setExcludeText}
+                placeholder="mechanical, sales, hardware"
+              />
+            </div>
+          </div>
+        )}
 
         {showMaybe && (
           <p className="mb-3 text-xs text-on-surface-variant">

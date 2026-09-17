@@ -155,6 +155,65 @@ export const MIGRATIONS: Migration[] = [
       `)
     }
   }
+,
+  {
+    version: 3,
+    name: 'profile, resumes and tailoring',
+    up: (db) => {
+      db.exec(`
+        -- One row per field rather than columns: the set of things application
+        -- forms ask for keeps growing, and a key/value shape lets the UI add a
+        -- field without a migration.
+        CREATE TABLE profile (
+          key        TEXT PRIMARY KEY,
+          value      TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+
+        -- The long tail of questions forms ask ("willing to relocate?").
+        -- Saved as they are answered so the same question is never asked
+        -- twice, and reused across applications.
+        CREATE TABLE profile_answers (
+          id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          question   TEXT NOT NULL,
+          answer     TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(question)
+        ) STRICT;
+
+        -- The imported source resume. Text is extracted once at import, since
+        -- every tailoring run needs it and re-parsing a PDF is slow.
+        CREATE TABLE resumes (
+          id          INTEGER PRIMARY KEY AUTOINCREMENT,
+          label       TEXT    NOT NULL,
+          kind        TEXT    NOT NULL,
+          source_path TEXT,
+          text        TEXT    NOT NULL,
+          is_default  INTEGER NOT NULL DEFAULT 0,
+          created_at  TEXT    NOT NULL
+        ) STRICT;
+
+        -- A tailored version, kept rather than regenerated: the user may
+        -- export it later, or apply days after tailoring.
+        CREATE TABLE tailored_resumes (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          resume_id    INTEGER NOT NULL REFERENCES resumes(id) ON DELETE CASCADE,
+          posting_id   INTEGER,
+          company_name TEXT    NOT NULL,
+          job_title    TEXT    NOT NULL,
+          job_url      TEXT,
+          markdown     TEXT    NOT NULL,
+          changes      TEXT    NOT NULL DEFAULT '[]',
+          gaps         TEXT    NOT NULL DEFAULT '[]',
+          pdf_path     TEXT,
+          docx_path    TEXT,
+          created_at   TEXT    NOT NULL
+        ) STRICT;
+
+        CREATE INDEX idx_tailored_created ON tailored_resumes(created_at);
+      `)
+    }
+  }
 ]
 
 export function migrate(db: DatabaseSync): { from: number; to: number; applied: string[] } {

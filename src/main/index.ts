@@ -2,6 +2,7 @@ import { app, BrowserWindow, Notification } from 'electron'
 import { EVENTS } from '@shared/ipc'
 import { initDatabase } from './db/location'
 import { markOpened, registerIpc } from './ipc'
+import { registerResumeIpc } from './resume'
 import { appState } from './state'
 import { createTray, destroyTray } from './tray'
 import { getServerToken, getServerUrl, isConfigured } from './serverClient'
@@ -57,6 +58,7 @@ if (!app.requestSingleInstanceLock()) {
   void app.whenReady().then(() => {
     initDatabase()
     registerIpc()
+    registerResumeIpc()
     createTray(() => void pollForChanges())
 
     const win = createWindow()

@@ -10,7 +10,7 @@
 import { fetchCompany } from '../src/core/connectors/index'
 import {
   applyFilters, classify, classifyPosting, degreeAllowed, degreeRequirement,
-  detectFunction, isUnitedStatesLocation, matchesLocation, maybePostings
+  detectFunction, isUnitedStatesLocation, keywordsAllowed, matchesLocation, maybePostings
 } from '../src/core/classify'
 import { probe, slugCandidates } from '../src/core/probe'
 import type { ConnectorTarget } from '@shared/connector'
@@ -147,6 +147,18 @@ eq('CS-heavy description -> engineering',
   detectFunction('Summer Intern 2027', 'You will write code in Python and study algorithms with our team.'), 'engineering')
 eq('company boilerplate alone is not enough',
   detectFunction('Operations Intern', 'We build software for the world. Help our ops team run events.'), 'other')
+
+console.log('\n[title keywords]')
+check('no keywords passes everything', keywordsAllowed('Marketing Intern'))
+check('include matches', keywordsAllowed('Software Engineer Intern', ['software', 'swe']))
+check('include is case-insensitive', keywordsAllowed('SWE Intern', ['swe']))
+check('include misses drop the title', !keywordsAllowed('Mechanical Engineering Intern', ['software', 'swe']))
+check('exclude drops the title', !keywordsAllowed('Hardware Software Intern', [], ['hardware']))
+check('exclude wins over include', !keywordsAllowed('Software Sales Intern', ['software'], ['sales']))
+check('"ai" does not match inside "maintenance"', !keywordsAllowed('Maintenance Intern', ['ai']))
+check('"ai" matches as its own word', keywordsAllowed('AI Research Intern', ['ai']))
+check('symbol keywords work ("c++")', keywordsAllowed('C++ Developer Intern', ['c++']))
+check('blank keywords are ignored', keywordsAllowed('Marketing Intern', ['  ', ''], ['']))
 
 console.log('\n[degree requirement]')
 eq('PhD in title', degreeRequirement('Research Scientist Intern, PhD'), 'phd')
@@ -329,6 +341,46 @@ for (const c of [
       withLocation.find((p) => !(p.location as string).includes(','))?.location ?? undefined
     )
   }
+}
+
+console.log('\n[search-only platforms — live network]')
+// Big consumer brands that sit on neither a public ATS board nor Workday:
+// Netflix on Eightfold, Victoria's Secret on m-cloud's hosted jobs API. Both
+// are search-only, so these connectors query the early-career vocabulary
+// rather than listing the whole board (see EARLY_CAREER_QUERIES).
+for (const c of [
+  {
+    name: 'Netflix', ats: 'eightfold' as const,
+    careersUrl: 'https://explore.jobs.netflix.net', boardToken: 'netflix.com'
+  },
+  {
+    name: "Victoria's Secret", ats: 'mcloud' as const,
+    careersUrl: 'https://careers.victoriassecret.com/en/job-search-results/',
+    boardToken: '382ab4db-03e8-40cc-b413-51539aca9954'
+  }
+]) {
+  const res = await fetchCompany(target({ name: c.name, atsType: c.ats, careersUrl: c.careersUrl, boardToken: c.boardToken }))
+  check(`${c.name}: fetch succeeded`, res.ok, res.error)
+  if (!res.ok) continue
+
+  const ps = res.postings
+  check(`${c.name}: returned postings (${ps.length})`, ps.length > 0)
+  check(`${c.name}: every posting has a title`, ps.every((p) => !!p.title && p.title !== '(untitled)'))
+  check(`${c.name}: every applyUrl is absolute http(s)`, ps.every((p) => /^https?:\/\//.test(p.applyUrl)))
+  check(`${c.name}: external ids are unique`, new Set(ps.map((p) => p.externalId)).size === ps.length)
+  check(
+    `${c.name}: posted dates are real, not epoch garbage`,
+    ps.filter((p) => p.postedAt).every((p) => new Date(p.postedAt as string) > new Date('2000-01-01'))
+  )
+
+  const early = ps.map(classifyPosting).filter((p) => p.roleType !== 'other')
+  check(`${c.name}: found at least one early-career role`, early.length > 0)
+  check(
+    `${c.name}: early-career roles carry descriptions (tailoring needs them)`,
+    early.some((p) => (p.description ?? '').length > 200)
+  )
+  console.log(`        ${c.name}: ${ps.length} search hits, ${early.length} early-career`)
+  for (const e of early.slice(0, 4)) console.log(`          - [${e.roleType}] ${e.title} · ${e.location ?? 'no location'}`)
 }
 
 console.log('\n[probe — live discovery]')

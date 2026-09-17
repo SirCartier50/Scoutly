@@ -58,6 +58,9 @@ interface Settings {
   degreeLevel: 'bachelors' | 'masters' | 'phd' | null
   digestEmail: string | null
   maxPostingAgeDays: number
+  // Optional: a Worker that predates keyword filtering doesn't return them.
+  includeKeywords?: string[]
+  excludeKeywords?: string[]
 }
 
 const ROLE_LABEL: Record<RoleType, string> = {
@@ -572,6 +575,27 @@ function SettingsTab({
         </p>
       </Panel>
 
+      <Panel title="Title keywords">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <KeywordField
+            label="Only titles containing (any of)"
+            placeholder="e.g. software, swe, developer"
+            value={settings.includeKeywords ?? []}
+            onChange={(v) => setSettings({ ...settings, includeKeywords: v })}
+          />
+          <KeywordField
+            label="Never titles containing"
+            placeholder="e.g. mechanical, sales, hardware"
+            value={settings.excludeKeywords ?? []}
+            onChange={(v) => setSettings({ ...settings, excludeKeywords: v })}
+          />
+        </div>
+        <p className="mt-2 text-xs text-neutral-500">
+          The exact control over what reaches your email (and Postings). Comma-separated, not case-sensitive. Leave
+          &quot;only&quot; empty to allow everything that passes the other filters; &quot;never&quot; always wins.
+        </p>
+      </Panel>
+
       <Panel title="Degree level">
         <div className="flex flex-wrap gap-2">
           {([['bachelors', "Bachelor's"], ['masters', "Master's"], ['phd', 'PhD']] as const).map(([d, label]) => (
@@ -620,6 +644,31 @@ function SettingsTab({
 }
 
 /* -------------------------------------------------------------- primitives */
+
+/**
+ * Keeps its own raw text so typing "software," doesn't have the trailing comma
+ * eaten mid-keystroke (which parsing on every change would do), while still
+ * pushing the parsed list up immediately.
+ */
+function KeywordField({
+  label, placeholder, value, onChange
+}: { label: string; placeholder: string; value: string[]; onChange: (v: string[]) => void }) {
+  const [text, setText] = useState(value.join(', '))
+  return (
+    <label className="flex flex-col gap-1 text-sm">
+      {label}
+      <input
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value)
+          onChange(e.target.value.split(',').map((s) => s.trim()).filter(Boolean))
+        }}
+        placeholder={placeholder}
+        className="rounded-md border border-neutral-700 bg-neutral-900 px-3 py-2"
+      />
+    </label>
+  )
+}
 
 function PostingList({
   postings, onSelect, selectedId
